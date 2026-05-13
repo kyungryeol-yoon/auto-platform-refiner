@@ -9,9 +9,8 @@
 사내망 규칙 준수:
 - 임베딩:  embed = AsyncOpenAI(base_url, api_key, default_headers)
            embed.embeddings.create(input=[text], model=EMBEDDING_MODEL)
-- 벡터DB:  chromadb.HttpClient(host, port)  (사내 k8s 의 Chroma 서비스)
-           qdrant/pgvector 도 host:port 로 접속 가능 — DocIngestor.__init__
-           안의 클라이언트만 교체하면 됨.
+- 벡터DB:  VECTOR_DB 스위치로 chroma / qdrant / pgvector 선택. 모두 host:port
+           로 접속하는 사내 k8s 인스턴스 가정.
 """
 
 import asyncio
@@ -20,8 +19,8 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Any, Protocol
 
-import chromadb
 from openai import AsyncOpenAI
 
 # ================= CONFIGURATION =================
@@ -33,31 +32,174 @@ SOURCE_DIR = r"./test_docs"
 EMBEDDING_API_BASE = "your-api-endpoint"
 EMBEDDING_API_KEY = "your-api-key"
 EMBEDDING_MODEL = "mxbai-embed-large"
+EMBEDDING_DIM = 1024             # 모델별: mxbai-embed-large=1024, nomic-embed-text=768
 EMBEDDING_DEFAULT_HEADERS: dict[str, str] = {
     # 사내 게이트웨이가 요구하는 헤더 (인증/테넌트 등)
     # 예) "X-Tenant-Id": "platform-team",
 }
 
-# 벡터 DB - Chroma HttpClient (사내 k8s 의 chroma 서비스)
-#   qdrant/pgvector 사용 시 _init_vector_store() 안의 클라이언트만 교체.
-CHROMA_HOST = "chroma.intra"     # 예: "chroma.platform.svc.cluster.local"
+# ---------- 벡터 DB 선택 ----------
+VECTOR_DB = "chroma"   # "chroma" | "qdrant" | "pgvector"
+
+# Chroma (사내 k8s 의 chromadb 서비스)
+CHROMA_HOST = "chroma.intra"
 CHROMA_PORT = 8000
 CHROMA_SSL = False
-CHROMA_HEADERS: dict[str, str] = {
-    # chroma 앞단에 인증 게이트웨이가 있다면 헤더 추가
-    # 예) "Authorization": "Bearer xxx",
-}
+CHROMA_HEADERS: dict[str, str] = {}
 CHROMA_COLLECTION = "platform_docs"
 
+# Qdrant (사내 k8s 의 qdrant 서비스)
+QDRANT_HOST = "qdrant.intra"
+QDRANT_PORT = 6333
+QDRANT_HTTPS = False
+QDRANT_API_KEY: str | None = None
+QDRANT_COLLECTION = "platform_docs"
+QDRANT_DISTANCE = "Cosine"       # "Cosine" | "Dot" | "Euclid"
+
+# pgvector (사내 k8s 의 postgres + vector extension)
+PGVECTOR_DSN = "postgresql://rag:rag@pgvector.intra:5432/rag"
+PGVECTOR_TABLE = "platform_docs"
+# 참고 — 테이블 스키마는 미리 만들어 두어야 합니다:
+#   CREATE EXTENSION IF NOT EXISTS vector;
+#   CREATE TABLE platform_docs (
+#       id        TEXT PRIMARY KEY,
+#       embedding vector(1024),     -- EMBEDDING_DIM 과 일치
+#       document  TEXT,
+#       metadata  JSONB
+#   );
+
 # 호출량 제어
-MAX_EMBED_CHARS = 800            # 임베딩에 보낼 텍스트 최대 글자수
-EMBED_CONCURRENCY = 2            # 동시 호출 수 (사내 게이트웨이가 약하면 1 로)
-EMBED_RETRY = 3                  # 실패 시 재시도 횟수 (백오프: 2,4,8s)
+MAX_EMBED_CHARS = 800
+EMBED_CONCURRENCY = 2
+EMBED_RETRY = 3
 CACHE_FILE = "./.embedding_cache.json"
 # =================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# ================= Vector store backends =================
+class VectorStore(Protocol):
+    """공통 인터페이스. 새 백엔드 추가 시 upsert 만 구현하면 됨."""
+    name: str
+    location: str
+
+    def upsert(
+        self,
+        doc_id: str,
+        embedding: list[float],
+        document: str,
+        metadata: dict[str, Any],
+    ) -> None: ...
+
+
+class ChromaStore:
+    name = "chroma"
+
+    def __init__(self) -> None:
+        import chromadb  # 선택적 의존성
+        client = chromadb.HttpClient(
+            host=CHROMA_HOST,
+            port=CHROMA_PORT,
+            ssl=CHROMA_SSL,
+            headers=CHROMA_HEADERS or None,
+        )
+        self.collection = client.get_or_create_collection(CHROMA_COLLECTION)
+        scheme = "https" if CHROMA_SSL else "http"
+        self.location = f"{scheme}://{CHROMA_HOST}:{CHROMA_PORT}/{CHROMA_COLLECTION}"
+
+    def upsert(self, doc_id, embedding, document, metadata):
+        # Chroma 메타데이터는 scalar(str/int/float/bool) 만 허용
+        flat = {k: (v if isinstance(v, (str, int, float, bool)) else str(v))
+                for k, v in metadata.items() if v is not None}
+        self.collection.upsert(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[flat],
+        )
+
+
+class QdrantStore:
+    name = "qdrant"
+
+    def __init__(self) -> None:
+        from qdrant_client import QdrantClient
+        from qdrant_client.http.models import Distance, VectorParams
+
+        self.client = QdrantClient(
+            host=QDRANT_HOST,
+            port=QDRANT_PORT,
+            https=QDRANT_HTTPS,
+            api_key=QDRANT_API_KEY,
+        )
+        distance_map = {
+            "Cosine": Distance.COSINE,
+            "Dot": Distance.DOT,
+            "Euclid": Distance.EUCLID,
+        }
+        if not self.client.collection_exists(QDRANT_COLLECTION):
+            self.client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_DIM,
+                    distance=distance_map.get(QDRANT_DISTANCE, Distance.COSINE),
+                ),
+            )
+        scheme = "https" if QDRANT_HTTPS else "http"
+        self.location = f"{scheme}://{QDRANT_HOST}:{QDRANT_PORT}/{QDRANT_COLLECTION}"
+
+    def upsert(self, doc_id, embedding, document, metadata):
+        import uuid
+        from qdrant_client.http.models import PointStruct
+        # Qdrant 의 point id 는 UUID 또는 unsigned int 만 허용 → doc_id 로 UUID5 생성
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_OID, doc_id))
+        payload = {"doc_id": doc_id, "document": document, **metadata}
+        self.client.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[PointStruct(id=point_id, vector=embedding, payload=payload)],
+        )
+
+
+class PgVectorStore:
+    name = "pgvector"
+
+    def __init__(self) -> None:
+        import psycopg
+        from pgvector.psycopg import register_vector
+
+        self.conn = psycopg.connect(PGVECTOR_DSN, autocommit=False)
+        register_vector(self.conn)
+        # 테이블 이름은 SQL 식별자 — 화이트리스트 검증
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PGVECTOR_TABLE):
+            raise ValueError(f"Unsafe PGVECTOR_TABLE: {PGVECTOR_TABLE}")
+        self.table = PGVECTOR_TABLE
+        self.location = f"{PGVECTOR_DSN}#{self.table}"
+
+    def upsert(self, doc_id, embedding, document, metadata):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self.table} (id, embedding, document, metadata) "
+                f"VALUES (%s, %s, %s, %s) "
+                f"ON CONFLICT (id) DO UPDATE SET "
+                f"  embedding = EXCLUDED.embedding, "
+                f"  document  = EXCLUDED.document, "
+                f"  metadata  = EXCLUDED.metadata",
+                (doc_id, embedding, document, json.dumps(metadata, ensure_ascii=False)),
+            )
+        self.conn.commit()
+
+
+def make_vector_store(kind: str) -> VectorStore:
+    if kind == "chroma":
+        return ChromaStore()
+    if kind == "qdrant":
+        return QdrantStore()
+    if kind == "pgvector":
+        return PgVectorStore()
+    raise ValueError(f"Unknown VECTOR_DB: {kind!r} (expected chroma|qdrant|pgvector)")
+# =========================================================
 
 
 class DocIngestor:
@@ -78,15 +220,7 @@ class DocIngestor:
             except Exception as e:
                 logger.warning(f"Cache load failed ({e}), starting empty.")
 
-        # 벡터 DB - 사내 k8s 의 Chroma 서비스에 HTTP 로 접속
-        self.chroma = chromadb.HttpClient(
-            host=CHROMA_HOST,
-            port=CHROMA_PORT,
-            ssl=CHROMA_SSL,
-            headers=CHROMA_HEADERS or None,
-        )
-        self.collection = self.chroma.get_or_create_collection(CHROMA_COLLECTION)
-
+        self.store: VectorStore = make_vector_store(VECTOR_DB)
         self.source_root = Path(SOURCE_DIR).resolve()
 
     # ---------- parsing ----------
@@ -125,12 +259,12 @@ class DocIngestor:
         if fm_category:
             return fm_category
         rel_parts = readme_path.relative_to(self.source_root).parts
-        if len(rel_parts) >= 3:  # <category>/<project>/README.md
+        if len(rel_parts) >= 3:
             return rel_parts[0]
         return "etc"
 
     # ---------- embedding ----------
-    async def _embed(self, text: str) -> list[float] | None:
+    async def _embed_text(self, text: str) -> list[float] | None:
         async with self.sem:
             for attempt in range(1, EMBED_RETRY + 1):
                 try:
@@ -166,31 +300,29 @@ class DocIngestor:
         if self.cache.get(doc_id) == digest:
             return "skip:cached"
 
-        vec = await self._embed(embed_text)
+        vec = await self._embed_text(embed_text)
         if vec is None:
             return "fail:embed"
 
         category = self._derive_category(readme_path, meta.get("category"))
         rel = readme_path.relative_to(self.source_root).as_posix()
-        chroma_meta: dict[str, str | int | float | bool] = {
+        metadata: dict[str, Any] = {
             "source_path": rel,
             "folder": readme_path.parent.relative_to(self.source_root).as_posix(),
             "project_name": readme_path.parent.name,
             "category": category,
         }
         for k, v in meta.items():
-            if k == "category":
+            if k == "category" or v is None:
                 continue
-            if v is None:
-                continue
-            chroma_meta[k] = str(v)
+            metadata[k] = str(v)
 
-        self.collection.upsert(
-            ids=[doc_id],
-            embeddings=[vec],
-            documents=[embed_text],
-            metadatas=[chroma_meta],
-        )
+        try:
+            self.store.upsert(doc_id, vec, embed_text, metadata)
+        except Exception as e:
+            logger.error(f"   vector-store upsert failed for {doc_id}: {e}")
+            return "fail:upsert"
+
         self.cache[doc_id] = digest
         return "ok"
 
@@ -207,7 +339,7 @@ class DocIngestor:
 
         logger.info(
             f"Ingest start - {len(readmes)} README files, "
-            f"chroma=http://{CHROMA_HOST}:{CHROMA_PORT}/{CHROMA_COLLECTION}, "
+            f"store={self.store.name} ({self.store.location}), "
             f"concurrency={EMBED_CONCURRENCY}, max_chars={MAX_EMBED_CHARS}"
         )
         results = await asyncio.gather(*(self.ingest_one(p) for p in readmes))
