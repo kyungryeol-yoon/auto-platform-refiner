@@ -1,11 +1,17 @@
-"""organize_docs.py 로 정리된 README.md 를 RAG 벡터 DB(Chroma) 에 적재.
+"""organize_docs.py 로 정리된 README.md 를 RAG 벡터 DB 에 적재.
 
 호출량 폭주 방지가 목표.
 - 폴더당 1 청크 (Front-matter + 본문 발췌, MAX_EMBED_CHARS 상한)
-- Front-matter 는 메타데이터로 분리 → Chroma metadata 로 저장 (본문 노이즈 제거)
+- Front-matter 는 메타데이터로 분리 → 벡터 DB metadata 로 저장 (본문 노이즈 제거)
 - sha256 캐시: 변경 없는 README 는 임베딩 호출 자체를 스킵
-- AsyncOpenAI(default_headers=...) 로 사내 임베딩 API 호출
 - Semaphore + 지수 백오프 재시도로 게이트웨이 rate-limit 회피
+
+사내망 규칙 준수:
+- 임베딩:  embed = AsyncOpenAI(base_url, api_key, default_headers)
+           embed.embeddings.create(input=[text], model=EMBEDDING_MODEL)
+- 벡터DB:  chromadb.HttpClient(host, port)  (사내 k8s 의 Chroma 서비스)
+           qdrant/pgvector 도 host:port 로 접속 가능 — DocIngestor.__init__
+           안의 클라이언트만 교체하면 됨.
 """
 
 import asyncio
@@ -21,17 +27,26 @@ from openai import AsyncOpenAI
 # ================= CONFIGURATION =================
 SOURCE_DIR = r"./test_docs"
 
-# 사내 임베딩 API (OpenAI 호환 게이트웨이 가정).
-# Ollama 를 그대로 쓰려면 BASE 를 "http://localhost:11434/v1" 로 지정.
-EMBEDDING_API_KEY = "your-api-key"
+# 사내 임베딩 API (OpenAI 호환 게이트웨이).
+#   embed = AsyncOpenAI(base_url, api_key, default_headers)
+#   embed.embeddings.create(input=[text], model=EMBEDDING_MODEL)
 EMBEDDING_API_BASE = "your-api-endpoint"
+EMBEDDING_API_KEY = "your-api-key"
 EMBEDDING_MODEL = "mxbai-embed-large"
 EMBEDDING_DEFAULT_HEADERS: dict[str, str] = {
-    # 사내 게이트웨이가 요구하는 헤더가 있다면 여기에 추가
+    # 사내 게이트웨이가 요구하는 헤더 (인증/테넌트 등)
+    # 예) "X-Tenant-Id": "platform-team",
 }
 
-# Chroma
-CHROMA_PERSIST_DIR = "./chroma_db"
+# 벡터 DB - Chroma HttpClient (사내 k8s 의 chroma 서비스)
+#   qdrant/pgvector 사용 시 _init_vector_store() 안의 클라이언트만 교체.
+CHROMA_HOST = "chroma.intra"     # 예: "chroma.platform.svc.cluster.local"
+CHROMA_PORT = 8000
+CHROMA_SSL = False
+CHROMA_HEADERS: dict[str, str] = {
+    # chroma 앞단에 인증 게이트웨이가 있다면 헤더 추가
+    # 예) "Authorization": "Bearer xxx",
+}
 CHROMA_COLLECTION = "platform_docs"
 
 # 호출량 제어
@@ -47,9 +62,10 @@ logger = logging.getLogger(__name__)
 
 class DocIngestor:
     def __init__(self) -> None:
-        self.client = AsyncOpenAI(
-            api_key=EMBEDDING_API_KEY,
+        # 임베딩 클라이언트 (사내망 규칙: AsyncOpenAI + input=[text])
+        self.embed = AsyncOpenAI(
             base_url=EMBEDDING_API_BASE,
+            api_key=EMBEDDING_API_KEY,
             default_headers=EMBEDDING_DEFAULT_HEADERS or None,
         )
         self.sem = asyncio.Semaphore(EMBED_CONCURRENCY)
@@ -62,7 +78,13 @@ class DocIngestor:
             except Exception as e:
                 logger.warning(f"Cache load failed ({e}), starting empty.")
 
-        self.chroma = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        # 벡터 DB - 사내 k8s 의 Chroma 서비스에 HTTP 로 접속
+        self.chroma = chromadb.HttpClient(
+            host=CHROMA_HOST,
+            port=CHROMA_PORT,
+            ssl=CHROMA_SSL,
+            headers=CHROMA_HEADERS or None,
+        )
         self.collection = self.chroma.get_or_create_collection(CHROMA_COLLECTION)
 
         self.source_root = Path(SOURCE_DIR).resolve()
@@ -112,9 +134,9 @@ class DocIngestor:
         async with self.sem:
             for attempt in range(1, EMBED_RETRY + 1):
                 try:
-                    resp = await self.client.embeddings.create(
+                    resp = await self.embed.embeddings.create(
+                        input=[text],
                         model=EMBEDDING_MODEL,
-                        input=text,
                     )
                     return resp.data[0].embedding
                 except Exception as e:
@@ -185,6 +207,7 @@ class DocIngestor:
 
         logger.info(
             f"Ingest start - {len(readmes)} README files, "
+            f"chroma=http://{CHROMA_HOST}:{CHROMA_PORT}/{CHROMA_COLLECTION}, "
             f"concurrency={EMBED_CONCURRENCY}, max_chars={MAX_EMBED_CHARS}"
         )
         results = await asyncio.gather(*(self.ingest_one(p) for p in readmes))
