@@ -41,7 +41,8 @@ OLLAMA_MODEL = "llama3"
 # 옵션
 DRY_RUN = False
 LLM_TEMPERATURE = 0.1
-MAX_README_TOKENS = 800
+MAX_README_TOKENS = 600          # LLM 측 토큰 상한 (대략 한글 1200~1500자)
+MAX_README_CHARS = 2000          # 디스크 저장 직전 강제 truncate (LLM 이 무시할 때 대비)
 CLASSIFY_TIMEOUT = 30
 README_TIMEOUT = 60
 # =================================================
@@ -392,38 +393,70 @@ class DocOrganizer:
         return self._parse_category(raw)
 
     # ---------- README generation ----------
+    @staticmethod
+    def _truncate_readme(text: str, max_chars: int = MAX_README_CHARS) -> str:
+        """LLM 이 길이 제약을 무시할 때를 대비한 안전망 (단어 경계로 자르기)."""
+        if len(text) <= max_chars:
+            return text
+        head = text[:max_chars]
+        # 줄 단위 경계에서 자르기
+        nl = head.rfind("\n")
+        if nl > max_chars * 0.7:
+            head = head[:nl]
+        return head.rstrip() + "\n\n<!-- truncated -->\n"
+
     async def generate_readme(self, folder: Path, category: str) -> str:
         snippets: list[str] = []
         for fname in ("Chart.yaml", "values.yaml", "deployment.yaml", "README.md", "README.txt"):
             fp = folder / fname
             if fp.exists() and fp.is_file():
                 try:
-                    snippets.append(f"--- {fname} ---\n{fp.read_text(encoding='utf-8', errors='ignore')[:1500]}")
+                    snippets.append(
+                        f"--- {fname} ---\n"
+                        f"{fp.read_text(encoding='utf-8', errors='ignore')[:1200]}"
+                    )
                 except Exception:
                     continue
         content_snippet = "\n".join(snippets) or "(설정 파일 없음)"
 
+        # RAG 친화: Front-matter 는 ingest_docs.py 가 파싱할 수 있는 정확한 형식으로 강제.
+        # 본문은 임베딩 대상이 되므로 짧고 키워드 밀도가 높아야 함.
         prompt = f"""당신은 사내 인프라 문서화 전문가입니다.
-아래 프로젝트의 RAG 검색 친화적인 README.md 를 작성하세요.
+아래 프로젝트의 README.md 를 RAG 검색용으로 작성하세요.
 
-[제약]
-- 전체 1500자 이내 (한글 기준)
-- YAML 원문을 그대로 복사하지 말 것 (요약만)
-- 다음 섹션 순서로 작성:
-  1) Front-matter (--- 로 감싼 category, tags, version, location)
-  2) 한 줄 요약
-  3) 핵심 키워드 5개 (쉼표 구분)
-  4) 기술 스택
-  5) 핵심 설정 요약 (포트, 엔드포인트 등 중요한 값만)
+[엄수 사항]
+- 전체 1200자 이내 (한글 기준). 절대 초과 금지.
+- YAML 원문 복사 금지. 핵심 값(포트, 이미지, 엔드포인트)만 한 줄씩 요약.
+- 출력은 아래 템플릿을 그대로 따르세요. 섹션을 추가/생략하지 마세요.
 
-[데이터]
+[출력 템플릿]
+---
+category: {category}
+project: <도구명 소문자>
+version: <감지된 버전 또는 unknown>
+location: {folder.as_posix()}
+tags: [<쉼표로 3~5개>]
+---
+
+# <도구명> <버전>
+
+**Summary**: <한 문장 한국어 요약>
+
+**Keywords**: <쉼표로 5개의 검색 키워드>
+
+## Stack
+- <핵심 기술 1>
+- <핵심 기술 2>
+
+## Config
+- <중요 설정값 1>
+- <중요 설정값 2>
+
+[입력 데이터]
 - 폴더명: {folder.name}
 - 카테고리: {category}
-- 위치: {folder.as_posix()}
 - 설정 발췌:
 {content_snippet}
-
-응답은 Markdown 만, Front-matter 부터 시작하세요.
 """
         result = await self.call_llm(
             prompt,
@@ -432,10 +465,11 @@ class DocOrganizer:
             timeout=README_TIMEOUT,
         )
         if result:
-            return result
+            return self._truncate_readme(result)
         return (
-            f"---\ncategory: {category}\nlocation: {folder.as_posix()}\n---\n"
-            f"# {folder.name}\n\n자동 생성 실패 — 수동 작성 필요.\n"
+            f"---\ncategory: {category}\nproject: {folder.name}\n"
+            f"version: unknown\nlocation: {folder.as_posix()}\ntags: []\n---\n"
+            f"# {folder.name}\n\n**Summary**: 자동 생성 실패 — 수동 작성 필요.\n"
         )
 
     # ---------- Processing ----------

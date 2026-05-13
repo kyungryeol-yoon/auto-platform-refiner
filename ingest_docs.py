@@ -1,92 +1,209 @@
-import os
-from pathlib import Path
+"""organize_docs.py 로 정리된 README.md 를 RAG 벡터 DB(Chroma) 에 적재.
+
+호출량 폭주 방지가 목표.
+- 폴더당 1 청크 (Front-matter + 본문 발췌, MAX_EMBED_CHARS 상한)
+- Front-matter 는 메타데이터로 분리 → Chroma metadata 로 저장 (본문 노이즈 제거)
+- sha256 캐시: 변경 없는 README 는 임베딩 호출 자체를 스킵
+- AsyncOpenAI(default_headers=...) 로 사내 임베딩 API 호출
+- Semaphore + 지수 백오프 재시도로 게이트웨이 rate-limit 회피
+"""
+
+import asyncio
+import hashlib
+import json
 import logging
-from langchain_community.document_loaders import DirectoryLoader, UnstructuredMarkdownLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+import re
+from pathlib import Path
+
+import chromadb
+from openai import AsyncOpenAI
 
 # ================= CONFIGURATION =================
-# 1. 소스 경로 (organize_docs.py에 의해 정리된 폴더)
-SOURCE_DIR = r"./test_docs" 
+SOURCE_DIR = r"./test_docs"
 
-# 2. Ollama 임베딩 설정
-OLLAMA_BASE_URL = "http://localhost:11434"
-EMBEDDING_MODEL = "mxbai-embed-large" # 또는 "nomic-embed-text"
+# 사내 임베딩 API (OpenAI 호환 게이트웨이 가정).
+# Ollama 를 그대로 쓰려면 BASE 를 "http://localhost:11434/v1" 로 지정.
+EMBEDDING_API_KEY = "your-api-key"
+EMBEDDING_API_BASE = "your-api-endpoint"
+EMBEDDING_MODEL = "mxbai-embed-large"
+EMBEDDING_DEFAULT_HEADERS: dict[str, str] = {
+    # 사내 게이트웨이가 요구하는 헤더가 있다면 여기에 추가
+}
 
-# 3. 벡터 DB 저장 경로 (ChromaDB 기준)
+# Chroma
 CHROMA_PERSIST_DIR = "./chroma_db"
+CHROMA_COLLECTION = "platform_docs"
+
+# 호출량 제어
+MAX_EMBED_CHARS = 800            # 임베딩에 보낼 텍스트 최대 글자수
+EMBED_CONCURRENCY = 2            # 동시 호출 수 (사내 게이트웨이가 약하면 1 로)
+EMBED_RETRY = 3                  # 실패 시 재시도 횟수 (백오프: 2,4,8s)
+CACHE_FILE = "./.embedding_cache.json"
 # =================================================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+
 class DocIngestor:
-    def __init__(self):
-        # Ollama를 이용한 임베딩 모델 설정
-        self.embeddings = OllamaEmbeddings(
-            base_url=OLLAMA_BASE_URL,
-            model=EMBEDDING_MODEL
+    def __init__(self) -> None:
+        self.client = AsyncOpenAI(
+            api_key=EMBEDDING_API_KEY,
+            base_url=EMBEDDING_API_BASE,
+            default_headers=EMBEDDING_DEFAULT_HEADERS or None,
         )
-        # 텍스트 분할 설정 (Chunking)
-        # RAG 성능을 위해 의미 있는 단위로 쪼갭니다.
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100,
-            add_start_index=True
+        self.sem = asyncio.Semaphore(EMBED_CONCURRENCY)
+
+        self.cache_path = Path(CACHE_FILE)
+        self.cache: dict[str, str] = {}
+        if self.cache_path.exists():
+            try:
+                self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"Cache load failed ({e}), starting empty.")
+
+        self.chroma = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        self.collection = self.chroma.get_or_create_collection(CHROMA_COLLECTION)
+
+        self.source_root = Path(SOURCE_DIR).resolve()
+
+    # ---------- parsing ----------
+    @staticmethod
+    def _parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+        """YAML Front-matter 와 본문 분리. 미존재 시 ({}, text)."""
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)", text, re.DOTALL)
+        if not m:
+            return {}, text
+        front_raw, body = m.group(1), m.group(2)
+        meta: dict[str, str] = {}
+        for line in front_raw.splitlines():
+            mm = re.match(r"^\s*([\w\-]+)\s*:\s*(.+?)\s*$", line)
+            if mm:
+                key = mm.group(1).strip()
+                val = mm.group(2).strip().strip("\"'")
+                meta[key] = val
+        return meta, body
+
+    @staticmethod
+    def _build_embed_text(body: str, max_chars: int = MAX_EMBED_CHARS) -> str:
+        """본문에서 임베딩에 보낼 발췌 - 코드블럭 제거 + 첫 부분 발췌."""
+        stripped = re.sub(r"```[\s\S]*?```", "", body)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+        return stripped[:max_chars]
+
+    # ---------- collection ----------
+    def _readme_files(self) -> list[Path]:
+        return [p for p in self.source_root.rglob("README.md") if p.is_file()]
+
+    def _doc_id(self, readme_path: Path) -> str:
+        return readme_path.relative_to(self.source_root).as_posix()
+
+    def _derive_category(self, readme_path: Path, fm_category: str | None) -> str:
+        """category 우선순위: Front-matter > 부모 폴더 (target/<category>/<project>/README.md)."""
+        if fm_category:
+            return fm_category
+        rel_parts = readme_path.relative_to(self.source_root).parts
+        if len(rel_parts) >= 3:  # <category>/<project>/README.md
+            return rel_parts[0]
+        return "etc"
+
+    # ---------- embedding ----------
+    async def _embed(self, text: str) -> list[float] | None:
+        async with self.sem:
+            for attempt in range(1, EMBED_RETRY + 1):
+                try:
+                    resp = await self.client.embeddings.create(
+                        model=EMBEDDING_MODEL,
+                        input=text,
+                    )
+                    return resp.data[0].embedding
+                except Exception as e:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"   embedding fail [{attempt}/{EMBED_RETRY}] {e} — retry in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+            return None
+
+    async def ingest_one(self, readme_path: Path) -> str:
+        try:
+            text = readme_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"read fail {readme_path}: {e}")
+            return "fail:read"
+
+        meta, body = self._parse_front_matter(text)
+        embed_text = self._build_embed_text(body)
+        if not embed_text.strip():
+            logger.info(f"   skip (empty) {readme_path}")
+            return "skip:empty"
+
+        # Hash cache — embed 대상 텍스트 자체가 동일하면 재호출 안 함
+        digest = hashlib.sha256(embed_text.encode("utf-8")).hexdigest()
+        doc_id = self._doc_id(readme_path)
+        if self.cache.get(doc_id) == digest:
+            return "skip:cached"
+
+        vec = await self._embed(embed_text)
+        if vec is None:
+            return "fail:embed"
+
+        category = self._derive_category(readme_path, meta.get("category"))
+        rel = readme_path.relative_to(self.source_root).as_posix()
+        chroma_meta: dict[str, str | int | float | bool] = {
+            "source_path": rel,
+            "folder": readme_path.parent.relative_to(self.source_root).as_posix(),
+            "project_name": readme_path.parent.name,
+            "category": category,
+        }
+        for k, v in meta.items():
+            if k == "category":
+                continue
+            if v is None:
+                continue
+            chroma_meta[k] = str(v)
+
+        self.collection.upsert(
+            ids=[doc_id],
+            embeddings=[vec],
+            documents=[embed_text],
+            metadatas=[chroma_meta],
         )
+        self.cache[doc_id] = digest
+        return "ok"
 
-    def load_documents(self):
-        """정리된 폴더 구조에서 README.md 파일만 수집합니다."""
-        logger.info(f"📄 {SOURCE_DIR} 내의 README.md 파일을 수집 중입니다...")
-        
-        if not Path(SOURCE_DIR).exists():
-            logger.error(f"경로가 존재하지 않습니다: {SOURCE_DIR}")
-            return []
-
-        # DirectoryLoader는 폴더 구조를 유지하며 파일을 읽고, 
-        # 메타데이터에 파일 경로(source)를 자동으로 넣어줍니다.
-        loader = DirectoryLoader(
-            SOURCE_DIR, 
-            glob="**/README.md", 
-            loader_cls=UnstructuredMarkdownLoader,
-            show_progress=True
-        )
-        return loader.load()
-
-    def run(self):
-        # 1. 문서 로드
-        raw_docs = self.load_documents()
-        if not raw_docs:
-            logger.error("❌ 수집된 문서가 없습니다. 먼저 organize_docs.py를 실행했는지 확인하세요.")
+    # ---------- run ----------
+    async def run(self) -> None:
+        if not self.source_root.exists():
+            logger.error(f"SOURCE_DIR not found: {self.source_root}")
             return
 
-        # 2. 문서 분할 (Chunking)
-        # 너무 긴 문서는 AI가 처리하기 힘들므로 적절한 크기로 자릅니다.
-        final_docs = self.text_splitter.split_documents(raw_docs)
-        logger.info(f"✂️ 총 {len(raw_docs)}개의 파일을 {len(final_docs)}개의 조각(Chunk)으로 분할했습니다.")
+        readmes = self._readme_files()
+        if not readmes:
+            logger.error("No README.md found. Run organize_docs.py first.")
+            return
 
-        # 3. 벡터 DB 저장 (ChromaDB)
-        # PGVector나 Qdrant 사용 시 이 부분을 해당 클래스로 교체하면 됩니다.
-        logger.info(f"📦 벡터 DB 생성 및 저장 중 (저장소: {CHROMA_PERSIST_DIR})...")
-        vector_db = Chroma.from_documents(
-            documents=final_docs,
-            embedding=self.embeddings,
-            persist_directory=CHROMA_PERSIST_DIR
+        logger.info(
+            f"Ingest start - {len(readmes)} README files, "
+            f"concurrency={EMBED_CONCURRENCY}, max_chars={MAX_EMBED_CHARS}"
         )
-        
-        # 저장 확정 (Chroma v0.4+ 에서는 자동으로 되지만 명시적 확인)
-        logger.info("✅ 벡터 DB 저장 완료! 이제 Dify 등에서 이 DB를 참조할 수 있습니다.")
+        results = await asyncio.gather(*(self.ingest_one(p) for p in readmes))
+
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r] = counts.get(r, 0) + 1
+        logger.info(f"Ingest done: {counts}")
+
+        try:
+            self.cache_path.write_text(
+                json.dumps(self.cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"Cache save failed: {e}")
+
 
 if __name__ == "__main__":
-    # 필요한 라이브러리 체크 및 안내
     try:
-        import langchain
-        import chromadb
-    except ImportError:
-        print("\n[알림] 실행을 위해 아래 라이브러리 설치가 필요합니다:")
-        print("pip install langchain langchain-community chromadb unstructured markdown\n")
-        exit(1)
-
-    ingestor = DocIngestor()
-    ingestor.run()
+        asyncio.run(DocIngestor().run())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
