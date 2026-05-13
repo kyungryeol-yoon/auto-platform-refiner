@@ -6,6 +6,8 @@
 """
 
 import asyncio
+import csv
+import datetime as _dt
 import json
 import logging
 import re
@@ -45,6 +47,10 @@ MAX_README_TOKENS = 600          # LLM 측 토큰 상한 (대략 한글 1200~150
 MAX_README_CHARS = 2000          # 디스크 저장 직전 강제 truncate (LLM 이 무시할 때 대비)
 CLASSIFY_TIMEOUT = 30
 README_TIMEOUT = 60
+
+# 산출물
+CLASSIFICATION_LOG = "./classification_log.csv"   # 분류 결과 기록 (사후 검증용)
+INDEX_FILE_NAME = "INDEX.md"                       # TARGET_DIR 최상단에 생성
 # =================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -398,6 +404,8 @@ class DocOrganizer:
         )
         # word-boundary 매칭용으로 키워드를 길이 내림차순 정렬해 둠
         self._known_tool_keys = sorted(KNOWN_TOOLS.keys(), key=len, reverse=True)
+        # 분류 로그 (run 종료 시 CSV 로 flush)
+        self._log_rows: list[dict[str, str]] = []
 
     # ---------- LLM callers ----------
     async def _call_company(
@@ -636,13 +644,16 @@ tags: [<쉼표로 3~5개>]
 
     # ---------- Processing ----------
     async def process_folder(self, folder: Path, target_path: Path) -> None:
+        category, source, dest_str, status = "etc", "init", "", "error"
         try:
             category, source = await self.classify_folder(folder)
             new_parent = target_path / category
             dest_path = new_parent / folder.name
+            dest_str = dest_path.as_posix()
             logger.info(f"[{folder.name}] -> [{category}]  ({source})")
 
             if DRY_RUN:
+                status = "dry-run"
                 return
 
             new_parent.mkdir(exist_ok=True, parents=True)
@@ -650,9 +661,11 @@ tags: [<쉼표로 3~5개>]
             if dest_path.exists():
                 logger.warning(f"   Destination exists: {dest_path} (skipping move)")
                 working_path = folder
+                status = "skip-existing"
             else:
                 shutil.move(str(folder), str(dest_path))
                 working_path = dest_path
+                status = "ok"
 
             # 기존 README 백업 (모든 모드에서 일관되게)
             existing = working_path / "README.md"
@@ -666,6 +679,105 @@ tags: [<쉼표로 3~5개>]
             logger.info(f"   README.md created at {working_path}")
         except Exception as e:
             logger.error(f"Error processing {folder.name}: {e}")
+            status = f"error:{type(e).__name__}"
+        finally:
+            self._log_rows.append({
+                "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+                "folder": folder.name,
+                "category": category,
+                "source": source,
+                "destination": dest_str,
+                "status": status,
+            })
+
+    # ---------- Reporting ----------
+    def _write_classification_log(self) -> None:
+        if not self._log_rows:
+            return
+        path = Path(CLASSIFICATION_LOG)
+        # 기존 파일에 append, 헤더는 새 파일일 때만
+        write_header = not path.exists()
+        try:
+            with path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["timestamp", "folder", "category", "source", "destination", "status"],
+                )
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(self._log_rows)
+            logger.info(f"Classification log written: {path} (+{len(self._log_rows)} rows)")
+        except Exception as e:
+            logger.warning(f"Failed to write classification log: {e}")
+
+    @staticmethod
+    def _parse_front_matter(text: str) -> dict[str, str]:
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n?", text, re.DOTALL)
+        if not m:
+            return {}
+        meta: dict[str, str] = {}
+        for line in m.group(1).splitlines():
+            mm = re.match(r"^\s*([\w\-]+)\s*:\s*(.+?)\s*$", line)
+            if mm:
+                meta[mm.group(1).strip()] = mm.group(2).strip().strip("\"'")
+        return meta
+
+    def _write_index_md(self, target: Path) -> None:
+        """TARGET_DIR/INDEX.md 생성 — 전체 프로젝트 카탈로그."""
+        entries: list[tuple[str, str, str, str]] = []  # (category, project, version, location)
+        for cat_dir in sorted(target.iterdir()):
+            if not cat_dir.is_dir() or cat_dir.name.lower() not in ALLOWED_CATEGORIES:
+                continue
+            for proj_dir in sorted(cat_dir.iterdir()):
+                if not proj_dir.is_dir():
+                    continue
+                meta = {}
+                readme = proj_dir / "README.md"
+                if readme.exists():
+                    try:
+                        meta = self._parse_front_matter(readme.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                entries.append((
+                    cat_dir.name,
+                    meta.get("project", proj_dir.name),
+                    meta.get("version", "unknown"),
+                    f"{cat_dir.name}/{proj_dir.name}",
+                ))
+
+        if not entries:
+            logger.info("No categorized entries found, skipping INDEX.md")
+            return
+
+        # 카테고리별 카운트
+        by_cat: dict[str, int] = {}
+        for cat, _, _, _ in entries:
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+
+        lines: list[str] = []
+        lines.append("# Platform Doc Catalog")
+        lines.append("")
+        lines.append(f"_Generated: {_dt.date.today().isoformat()}  ·  "
+                     f"{len(entries)} projects across {len(by_cat)} categories_")
+        lines.append("")
+        lines.append("## Categories")
+        for cat in sorted(by_cat):
+            lines.append(f"- **{cat}** ({by_cat[cat]})")
+        lines.append("")
+        lines.append("## Projects")
+        lines.append("")
+        lines.append("| Category | Project | Version | Location |")
+        lines.append("|---|---|---|---|")
+        for cat, proj, ver, loc in entries:
+            lines.append(f"| {cat} | {proj} | {ver} | `{loc}` |")
+        lines.append("")
+
+        index_path = target / INDEX_FILE_NAME
+        try:
+            index_path.write_text("\n".join(lines), encoding="utf-8")
+            logger.info(f"INDEX written: {index_path} ({len(entries)} entries)")
+        except Exception as e:
+            logger.warning(f"Failed to write INDEX.md: {e}")
 
     async def run(self) -> None:
         target = Path(TARGET_DIR)
@@ -687,6 +799,10 @@ tags: [<쉼표로 3~5개>]
         logger.info(f"Starting (mode={self.mode}) — {len(folders)} folders")
         for folder in folders:
             await self.process_folder(folder, target)
+
+        # 산출물: 분류 로그(CSV) + 최상위 카탈로그(INDEX.md)
+        self._write_classification_log()
+        self._write_index_md(target)
         logger.info("All tasks completed.")
 
 
