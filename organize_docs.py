@@ -1,189 +1,501 @@
-import os
+"""사내 platform-doc 자동 분류 및 README 생성 통합 스크립트.
+
+- MODE = "hybrid" | "company" | "ollama" 로 동작 방식 선택
+- 사내 API는 AsyncOpenAI(api_key, base_url, default_headers) 로 호출
+- 분류는 (1) 룰 기반 화이트리스트 → (2) LLM + few-shot + JSON enum 검증 순서
+"""
+
 import asyncio
-import shutil
 import json
 import logging
+import re
+import shutil
 from pathlib import Path
-from openai import AsyncOpenAI
+
 import aiohttp
+from openai import AsyncOpenAI
 
 # ================= CONFIGURATION =================
-# 1. 경로 설정 (Windows 경로 입력 시 r"" 사용 필수)
-# 예: r"C:\Users\Name\Documents\platform-doc"
-TARGET_DIR = r"./test_docs" 
-BACKUP_DIR = r"./test_docs_backup" 
+TARGET_DIR = r"./test_docs"
 
-# 2. Ollama 설정 (분류용)
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "llama3"  # 사용 중인 모델명으로 변경 (예: eeve-korean:10.8b)
+# 동작 모드
+#   "hybrid"  : 사내 API 우선, 실패 시 Ollama
+#   "company" : 사내 API 만 사용
+#   "ollama"  : 로컬 Ollama 만 사용
+MODE = "hybrid"
 
-# 3. 사내 API 설정 (README 생성용)
+# 사내 API (OpenAI 호환 게이트웨이 가정)
 COMPANY_API_KEY = "your-api-key"
-COMPANY_API_BASE = "your-api-endpoint" 
-COMPANY_API_MODEL = "your-model-name"
+COMPANY_API_BASE = "your-api-endpoint"          # 예: "https://llm.intra.company.com/v1"
+COMPANY_API_MODEL = "gpt-oss"
+COMPANY_DEFAULT_HEADERS = {
+    # 사내 게이트웨이가 요구하는 헤더가 있다면 여기에 추가
+    # 예) "X-Tenant-Id": "platform-team",
+    #     "X-Project":   "doc-refiner",
+}
 
-# 4. 실행 옵션
-DRY_RUN = False  # True일 경우 실제 이동/파일생성을 하지 않고 로그만 출력
+# Ollama
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "llama3"
+
+# 옵션
+DRY_RUN = False
+LLM_TEMPERATURE = 0.1
+MAX_README_TOKENS = 800
+CLASSIFY_TIMEOUT = 30
+README_TIMEOUT = 60
 # =================================================
 
-# 로그 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# ---------- 카테고리 enum ----------
+# LLM 이 이 집합 밖의 값을 내면 "etc" 로 강등됨.
+ALLOWED_CATEGORIES = {
+    "infrastructure",   # OpenStack, VMware, bare-metal 같은 IaaS 레이어
+    "k8s-cluster",      # 클러스터 자체 (kubeadm, etcd, CNI, CRI, upgrade)
+    "api-gateway",
+    "service-mesh",
+    "ci-cd",
+    "devops-tools",     # n8n, ansible, terraform 등 자동화 도구
+    "monitoring",
+    "logging",
+    "database",
+    "messaging",
+    "storage",
+    "networking",
+    "security",
+    "registry",         # Harbor, Nexus 등 컨테이너/아티팩트 레지스트리
+    "etc",
+}
+
+# ---------- 룰 기반 화이트리스트 (CNCF Landscape + 사내 자주 쓰는 도구) ----------
+# 키: 도구명 (소문자), 값: 카테고리. 폴더명/Chart.yaml name 에서 word-boundary 매칭.
+KNOWN_TOOLS: dict[str, str] = {
+    # api-gateway
+    "kong": "api-gateway",
+    "ambassador": "api-gateway",
+    "traefik": "api-gateway",
+    "apisix": "api-gateway",
+    "nginx-ingress": "api-gateway",
+    "ingress-nginx": "api-gateway",
+    "haproxy": "api-gateway",
+    # service-mesh
+    "istio": "service-mesh",
+    "linkerd": "service-mesh",
+    "consul": "service-mesh",
+    # ci-cd
+    "argocd": "ci-cd",
+    "argo-cd": "ci-cd",
+    "argo-workflows": "ci-cd",
+    "argo-rollouts": "ci-cd",
+    "jenkins": "ci-cd",
+    "tekton": "ci-cd",
+    "flux": "ci-cd",
+    "fluxcd": "ci-cd",
+    "spinnaker": "ci-cd",
+    "gitlab-runner": "ci-cd",
+    "gitea": "ci-cd",
+    # devops-tools
+    "n8n": "devops-tools",
+    "airflow": "devops-tools",
+    "rundeck": "devops-tools",
+    "ansible": "devops-tools",
+    "terraform": "devops-tools",
+    "packer": "devops-tools",
+    "nifi": "devops-tools",
+    # monitoring
+    "prometheus": "monitoring",
+    "grafana": "monitoring",
+    "thanos": "monitoring",
+    "victoriametrics": "monitoring",
+    "alertmanager": "monitoring",
+    "jaeger": "monitoring",
+    "zipkin": "monitoring",
+    "opentelemetry": "monitoring",
+    "otel": "monitoring",
+    "datadog": "monitoring",
+    # logging
+    "elasticsearch": "logging",
+    "kibana": "logging",
+    "logstash": "logging",
+    "fluentd": "logging",
+    "fluent-bit": "logging",
+    "fluentbit": "logging",
+    "loki": "logging",
+    "promtail": "logging",
+    "opensearch": "logging",
+    # database
+    "postgres": "database",
+    "postgresql": "database",
+    "mysql": "database",
+    "mariadb": "database",
+    "mongodb": "database",
+    "mongo": "database",
+    "redis": "database",
+    "cassandra": "database",
+    "cockroachdb": "database",
+    "tidb": "database",
+    "clickhouse": "database",
+    "influxdb": "database",
+    # messaging
+    "kafka": "messaging",
+    "rabbitmq": "messaging",
+    "nats": "messaging",
+    "pulsar": "messaging",
+    "activemq": "messaging",
+    # storage
+    "minio": "storage",
+    "ceph": "storage",
+    "rook": "storage",
+    "longhorn": "storage",
+    "openebs": "storage",
+    "velero": "storage",
+    # networking
+    "cilium": "networking",
+    "calico": "networking",
+    "flannel": "networking",
+    "metallb": "networking",
+    "coredns": "networking",
+    # security
+    "cert-manager": "security",
+    "falco": "security",
+    "kyverno": "security",
+    "opa": "security",
+    "gatekeeper": "security",
+    "trivy": "security",
+    "vault": "security",
+    # registry
+    "harbor": "registry",
+    "nexus": "registry",
+    "artifactory": "registry",
+    # k8s-cluster (클러스터 운영 자체에 한정)
+    "kubeadm": "k8s-cluster",
+    "kubespray": "k8s-cluster",
+    "rancher": "k8s-cluster",
+    "k3s": "k8s-cluster",
+    "rke": "k8s-cluster",
+    "etcd": "k8s-cluster",
+    "kubelet": "k8s-cluster",
+    # infrastructure
+    "openstack": "infrastructure",
+    "vmware": "infrastructure",
+}
+
+
+FEW_SHOT_EXAMPLES = """[분류 예시]
+- 폴더명 "n8n-v1.0", 파일 ["deployment.yaml", "service.yaml"]
+  → {"category": "devops-tools", "reason": "n8n은 워크플로 자동화 도구 (deployment.yaml은 단지 k8s 배포 방식)"}
+- 폴더명 "kong-v2.0.1", 파일 ["Chart.yaml", "values.yaml"]
+  → {"category": "api-gateway", "reason": "Kong은 대표적인 API Gateway"}
+- 폴더명 "k8s-upgrade-v1.24-to-v1.26", 파일 ["upgrade.md"]
+  → {"category": "k8s-cluster", "reason": "클러스터 자체 업그레이드 가이드"}
+- 폴더명 "prometheus-stack", 파일 ["values.yaml"]
+  → {"category": "monitoring", "reason": "Prometheus 모니터링 스택"}
+- 폴더명 "harbor-registry", 파일 ["values.yaml"]
+  → {"category": "registry", "reason": "Harbor는 컨테이너 이미지 레지스트리"}
+"""
+
+
+def _build_classify_prompt(folder_name: str, files: list[str], context: str) -> str:
+    return f"""당신은 CNCF Landscape와 IT 인프라 분류 전문가입니다.
+
+[분류 규칙]
+1. 반드시 다음 카테고리 중 하나만 선택하세요 (그 외 값은 거부됩니다):
+   {", ".join(sorted(ALLOWED_CATEGORIES))}
+2. "k8s-cluster" 카테고리는 클러스터 자체 운영(kubeadm, etcd, CNI, CRI, upgrade)에만 사용합니다.
+   k8s 위에 deployment.yaml 로 배포되는 워크로드(n8n, kong, grafana 등)는
+   해당 도구의 본질적 기능 카테고리로 분류하세요.
+3. 분류 근거 우선순위: ① 폴더명에 포함된 도구명 → ② Chart.yaml 의 name/description
+   → ③ README 첫 단락 → ④ 파일 구성.
+
+{FEW_SHOT_EXAMPLES}
+
+응답은 반드시 아래 JSON 형식 한 줄로만 답하세요:
+{{"category": "<카테고리>", "reason": "<한 줄 근거>"}}
+
+[데이터]
+- 폴더명: {folder_name}
+- 파일 목록(최대 30개): {files[:30]}
+- 설정 파일 발췌:
+{context}
+"""
+
+
 class DocOrganizer:
-    def __init__(self):
+    def __init__(self, mode: str = MODE):
+        if mode not in {"hybrid", "company", "ollama"}:
+            raise ValueError(f"Unknown MODE: {mode}")
+        self.mode = mode
         self.client = AsyncOpenAI(
             api_key=COMPANY_API_KEY,
-            base_url=COMPANY_API_BASE
+            base_url=COMPANY_API_BASE,
+            default_headers=COMPANY_DEFAULT_HEADERS or None,
         )
-        # 기본 카테고리 후보 (AI가 이 중에서 고르거나 새로 제안함)
-        self.categories = ["infra", "database", "tool", "monitoring", "api-gateway", "ci-cd", "security", "k8s-cluster"]
+        # word-boundary 매칭용으로 키워드를 길이 내림차순 정렬해 둠
+        self._known_tool_keys = sorted(KNOWN_TOOLS.keys(), key=len, reverse=True)
 
-    async def call_ollama(self, prompt):
-        """Ollama API를 호출하여 분류 결과를 가져옵니다."""
+    # ---------- LLM callers ----------
+    async def _call_company(
+        self,
+        prompt: str,
+        use_json: bool,
+        max_tokens: int | None,
+        timeout: int,
+    ) -> str | None:
+        kwargs: dict = {
+            "model": COMPANY_API_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": LLM_TEMPERATURE,
+            "timeout": timeout,
+        }
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+        if use_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = await self.client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content
+        except TypeError:
+            # 사내 게이트웨이가 response_format 을 지원하지 않을 수 있음 → 재시도
+            kwargs.pop("response_format", None)
+            try:
+                resp = await self.client.chat.completions.create(**kwargs)
+                return resp.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"Company API failed (retry): {e}")
+                return None
+        except Exception as e:
+            logger.warning(f"Company API failed: {e}")
+            return None
+
+    async def _call_ollama(self, prompt: str, use_json: bool, timeout: int) -> str | None:
         payload = {
             "model": OLLAMA_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": "json"
         }
+        if use_json:
+            payload["format"] = "json"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(OLLAMA_URL, json=payload, timeout=30) as resp:
+                async with session.post(OLLAMA_URL, json=payload, timeout=timeout) as resp:
                     if resp.status != 200:
-                        logger.error(f"Ollama API Error: {resp.status}")
+                        logger.error(f"Ollama API HTTP {resp.status}")
                         return None
                     result = await resp.json()
-                    return json.loads(result['message']['content'])
+                    return result["message"]["content"]
         except Exception as e:
-            logger.error(f"Ollama Connection Error: {e}")
+            logger.error(f"Ollama call failed: {e}")
             return None
 
-    async def classify_folder(self, folder_name, files):
-        """폴더명과 파일 목록을 기반으로 카테고리를 결정합니다."""
-        prompt = f"""
-        당신은 IT 인프라 분류 전문가입니다. 다음 폴더명과 파일 목록을 보고 가장 적절한 카테고리를 하나만 골라주세요.
-        카테고리 후보: {", ".join(self.categories)}
-        만약 후보에 적당한 것이 없다면 가장 직관적인 새 카테고리명을 제안해주세요.
-        응답은 반드시 아래 JSON 형식으로만 해주세요:
-        {{"category": "카테고리명"}}
+    async def call_llm(
+        self,
+        prompt: str,
+        use_json: bool = False,
+        max_tokens: int | None = None,
+        timeout: int = 60,
+    ) -> str | None:
+        if self.mode == "ollama":
+            return await self._call_ollama(prompt, use_json, timeout)
+        result = await self._call_company(prompt, use_json, max_tokens, timeout)
+        if result is not None:
+            return result
+        if self.mode == "hybrid":
+            logger.info("   Falling back to Ollama...")
+            return await self._call_ollama(prompt, use_json, timeout)
+        return None
 
-        폴더명: {folder_name}
-        파일 목록: {files[:20]}
-        """
-        res = await self.call_ollama(prompt)
-        if res and "category" in res:
-            return res["category"].lower().replace(" ", "-")
-        return "etc"
+    # ---------- Classification ----------
+    def _match_known_tool(self, text: str) -> str | None:
+        text_lc = text.lower()
+        for kw in self._known_tool_keys:
+            # word-boundary: 영문/숫자/밑줄 외 문자로 둘러싸이거나 문자열 끝
+            pattern = rf"(?:^|[^a-z0-9]){re.escape(kw)}(?:[^a-z0-9]|$)"
+            if re.search(pattern, text_lc):
+                return KNOWN_TOOLS[kw]
+        return None
 
-    async def generate_readme(self, folder_path, category):
-        """폴더 내 주요 파일을 분석하여 README.md 내용을 생성합니다."""
-        context_files = ["Chart.yaml", "values.yaml", "deployment.yaml", "README.md", "README.txt"]
-        content_snippet = ""
-        
-        # 파일 내용 수집
-        for f_name in context_files:
-            f_path = folder_path / f_name
-            if f_path.exists() and f_path.is_file():
+    def _read_chart_name(self, folder: Path) -> str | None:
+        for cname in ("Chart.yaml", "Chart.yml"):
+            cpath = folder / cname
+            if not cpath.exists():
+                continue
+            try:
+                for line in cpath.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    m = re.match(r"^\s*name\s*:\s*['\"]?([\w\-\.]+)", line)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                continue
+        return None
+
+    def rule_based_classify(self, folder: Path) -> tuple[str, str] | None:
+        """폴더명 또는 Chart.yaml 의 name 으로 화이트리스트 매칭."""
+        hit = self._match_known_tool(folder.name)
+        if hit:
+            return hit, f"rule:folder-name~{folder.name}"
+        chart_name = self._read_chart_name(folder)
+        if chart_name:
+            hit = self._match_known_tool(chart_name)
+            if hit:
+                return hit, f"rule:Chart.yaml.name~{chart_name}"
+        return None
+
+    def _gather_classification_context(self, folder: Path) -> str:
+        """분류용 컨텍스트: Chart.yaml/values.yaml/README 첫 부분만 발췌."""
+        parts: list[str] = []
+        for fname in ("Chart.yaml", "Chart.yml", "values.yaml", "README.md", "README.txt"):
+            fpath = folder / fname
+            if fpath.exists() and fpath.is_file():
                 try:
-                    with open(f_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        # 파일당 최대 2000자까지만 읽어 context 구성
-                        content_snippet += f"\n--- File: {f_name} ---\n{f.read(2000)}\n"
-                except Exception as e:
-                    logger.warning(f"Could not read {f_name} in {folder_path}: {e}")
+                    snippet = fpath.read_text(encoding="utf-8", errors="ignore")[:600]
+                    parts.append(f"--- {fname} ---\n{snippet}")
+                except Exception:
+                    continue
+        return "\n".join(parts) if parts else "(no config files)"
 
-        if not content_snippet:
-            content_snippet = "설정 파일이 없거나 내용을 읽을 수 없습니다. 폴더 이름과 구조를 기반으로 작성해주세요."
-
-        prompt = f"""
-        당신은 사내 인프라 문서를 정리하는 전문가입니다. 제공된 내용을 바탕으로 이 프로젝트의 'README.md'를 작성해주세요.
-        이 문서는 나중에 RAG(검색 기반 생성) 시스템의 지식 베이스로 사용될 것이므로, 검색에 유리하도록 핵심 키워드와 기술적 맥락을 상세히 포함해야 합니다.
-
-        [작성 가이드]
-        1. 프로젝트 명칭 및 목적 (무엇을 위한 것인가?)
-        2. 주요 기술 스택 (예: Kong, Helm, Kubernetes v1.x 등)
-        3. 핵심 설정 요약 (중요한 엔드포인트나 옵션)
-        4. RAG용 메타데이터 (문서 최상단에 YAML Front-matter 형식으로 작성)
-           예:
-           ---
-           category: {category}
-           tags: [tag1, tag2]
-           version: v1.0.0
-           ---
-
-        [데이터 정보]
-        - 카테고리: {category}
-        - 현재 폴더명: {folder_path.name}
-        - 수집된 내용:
-        {content_snippet}
-        
-        응답은 Markdown 형식으로만 작성해주세요.
-        """
-        
+    def _parse_category(self, raw: str | None) -> tuple[str, str]:
+        if not raw:
+            return "etc", "llm-empty-response"
+        # JSON 객체만 추출 (모델이 코드펜스/잡담을 붙이는 경우 대비)
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        payload = m.group(0) if m else raw
         try:
-            response = await self.client.chat.completions.create(
-                model=COMPANY_API_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Company API Error: {e}")
-            return f"# README.md\n\n자동 생성 실패 (오류: {str(e)})\n카테고리: {category}"
+            obj = json.loads(payload)
+            cat = str(obj.get("category", "etc")).lower().strip().replace(" ", "-")
+            reason = str(obj.get("reason", "")).strip()
+            if cat not in ALLOWED_CATEGORIES:
+                logger.warning(f"   LLM returned unknown category '{cat}', falling back to etc")
+                return "etc", f"llm-unknown:{cat}"
+            return cat, f"llm:{reason}" if reason else "llm"
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning(f"   Failed to parse classification JSON ({e}): {raw[:200]!r}")
+            return "etc", "llm-parse-error"
 
-    async def process_folder(self, folder, target_path):
-        """개별 폴더를 분류, 이동 및 문서화합니다."""
+    async def classify_folder(self, folder: Path) -> tuple[str, str]:
+        # 1) Rule-based 우선
+        rule = self.rule_based_classify(folder)
+        if rule:
+            return rule
+
+        # 2) LLM (풍부한 컨텍스트 + few-shot + JSON enum 검증)
         try:
             files = [f.name for f in folder.iterdir()]
-            category = await self.classify_folder(folder.name, files)
-            
+        except Exception as e:
+            logger.warning(f"   Cannot list {folder}: {e}")
+            files = []
+        context = self._gather_classification_context(folder)
+        prompt = _build_classify_prompt(folder.name, files, context)
+        raw = await self.call_llm(prompt, use_json=True, timeout=CLASSIFY_TIMEOUT)
+        return self._parse_category(raw)
+
+    # ---------- README generation ----------
+    async def generate_readme(self, folder: Path, category: str) -> str:
+        snippets: list[str] = []
+        for fname in ("Chart.yaml", "values.yaml", "deployment.yaml", "README.md", "README.txt"):
+            fp = folder / fname
+            if fp.exists() and fp.is_file():
+                try:
+                    snippets.append(f"--- {fname} ---\n{fp.read_text(encoding='utf-8', errors='ignore')[:1500]}")
+                except Exception:
+                    continue
+        content_snippet = "\n".join(snippets) or "(설정 파일 없음)"
+
+        prompt = f"""당신은 사내 인프라 문서화 전문가입니다.
+아래 프로젝트의 RAG 검색 친화적인 README.md 를 작성하세요.
+
+[제약]
+- 전체 1500자 이내 (한글 기준)
+- YAML 원문을 그대로 복사하지 말 것 (요약만)
+- 다음 섹션 순서로 작성:
+  1) Front-matter (--- 로 감싼 category, tags, version, location)
+  2) 한 줄 요약
+  3) 핵심 키워드 5개 (쉼표 구분)
+  4) 기술 스택
+  5) 핵심 설정 요약 (포트, 엔드포인트 등 중요한 값만)
+
+[데이터]
+- 폴더명: {folder.name}
+- 카테고리: {category}
+- 위치: {folder.as_posix()}
+- 설정 발췌:
+{content_snippet}
+
+응답은 Markdown 만, Front-matter 부터 시작하세요.
+"""
+        result = await self.call_llm(
+            prompt,
+            use_json=False,
+            max_tokens=MAX_README_TOKENS,
+            timeout=README_TIMEOUT,
+        )
+        if result:
+            return result
+        return (
+            f"---\ncategory: {category}\nlocation: {folder.as_posix()}\n---\n"
+            f"# {folder.name}\n\n자동 생성 실패 — 수동 작성 필요.\n"
+        )
+
+    # ---------- Processing ----------
+    async def process_folder(self, folder: Path, target_path: Path) -> None:
+        try:
+            category, source = await self.classify_folder(folder)
             new_parent = target_path / category
             dest_path = new_parent / folder.name
-            
-            logger.info(f"Processing: [{folder.name}] -> Category: [{category}]")
+            logger.info(f"[{folder.name}] -> [{category}]  ({source})")
 
-            if not DRY_RUN:
-                new_parent.mkdir(exist_ok=True, parents=True)
-                
-                # 폴더 이동
-                if not dest_path.exists():
-                    shutil.move(str(folder), str(dest_path))
-                else:
-                    logger.warning(f"Destination already exists: {dest_path}. Skipping move.")
-                    dest_path = folder # 이동 실패 시 현재 위치에서 README 생성 시도
+            if DRY_RUN:
+                return
 
-                # README 생성
-                readme_content = await self.generate_readme(dest_path, category)
-                with open(dest_path / "README.md", "w", encoding="utf-8") as f:
-                    f.write(readme_content)
-                logger.info(f"   Successfully created README.md for {folder.name}")
+            new_parent.mkdir(exist_ok=True, parents=True)
+
+            if dest_path.exists():
+                logger.warning(f"   Destination exists: {dest_path} (skipping move)")
+                working_path = folder
+            else:
+                shutil.move(str(folder), str(dest_path))
+                working_path = dest_path
+
+            # 기존 README 백업 (모든 모드에서 일관되게)
+            existing = working_path / "README.md"
+            if existing.exists():
+                backup = working_path / "README_original.md"
+                if not backup.exists():
+                    existing.rename(backup)
+
+            readme = await self.generate_readme(working_path, category)
+            (working_path / "README.md").write_text(readme, encoding="utf-8")
+            logger.info(f"   README.md created at {working_path}")
         except Exception as e:
-            logger.error(f"Error processing folder {folder.name}: {e}")
+            logger.error(f"Error processing {folder.name}: {e}")
 
-    async def run(self):
+    async def run(self) -> None:
         target = Path(TARGET_DIR)
         if not target.exists():
             logger.error(f"Target directory does not exist: {TARGET_DIR}")
             return
 
-        # 최상위 폴더 목록 (이미 카테고리화된 폴더 제외 로직 필요 시 추가)
-        folders = [f for f in target.iterdir() if f.is_dir() and not f.name.startswith(('.', '_'))]
-        
+        # 이미 카테고리 폴더로 이동된 항목은 건너뜀
+        folders = [
+            f for f in target.iterdir()
+            if f.is_dir()
+            and not f.name.startswith((".", "_"))
+            and f.name.lower() not in ALLOWED_CATEGORIES
+        ]
         if not folders:
-            logger.info("No folders found to process.")
+            logger.info("No folders to process.")
             return
 
-        logger.info(f"Starting to process {len(folders)} folders...")
-        
-        # 병렬 처리를 원할 경우 asyncio.gather 사용 가능하나, 
-        # API 레이트 리밋과 파일 I/O 안정성을 위해 순차 처리를 기본으로 합니다.
+        logger.info(f"Starting (mode={self.mode}) — {len(folders)} folders")
         for folder in folders:
             await self.process_folder(folder, target)
-        
         logger.info("All tasks completed.")
 
+
 if __name__ == "__main__":
-    organizer = DocOrganizer()
+    organizer = DocOrganizer(mode=MODE)
     try:
         asyncio.run(organizer.run())
     except KeyboardInterrupt:
