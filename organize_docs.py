@@ -24,7 +24,7 @@ TARGET_DIR = r"./test_docs"
 #   "hybrid"  : 사내 API 우선, 실패 시 Ollama
 #   "company" : 사내 API 만 사용
 #   "ollama"  : 로컬 Ollama 만 사용
-MODE = "hybrid"
+MODE = "company"
 
 # 사내 API (OpenAI 호환 게이트웨이 가정)
 COMPANY_API_KEY = "your-api-key"
