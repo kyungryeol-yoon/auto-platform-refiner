@@ -24,6 +24,8 @@ from typing import Any, Protocol
 from openai import AsyncOpenAI
 
 # ================= CONFIGURATION =================
+# 이 경로는 organize_docs.py 의 TARGET_DIR 과 동일해야 합니다.
+# (organize_docs 가 분류해서 떨군 결과 = ingest_docs 가 읽는 입력)
 SOURCE_DIR = r"./test_docs"
 
 # 사내 임베딩 API (OpenAI 호환 게이트웨이).
