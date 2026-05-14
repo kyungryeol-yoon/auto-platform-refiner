@@ -76,8 +76,10 @@ ALLOWED_CATEGORIES = {
     "messaging",
     "storage",
     "networking",
-    "security",
+    "security",         # 인증/인가(SSO, LDAP, OIDC), 시크릿, 스캐너 포함
     "registry",         # Harbor, Nexus 등 컨테이너/아티팩트 레지스트리
+    "ml-ai",            # Kubeflow, MLflow, Jupyter, Ray 등 ML/AI 플랫폼
+    "documentation",    # Confluence, Bookstack, MediaWiki, Docusaurus 등
     "etc",
 }
 
@@ -286,7 +288,7 @@ KNOWN_TOOLS: dict[str, str] = {
     "ovn": "networking",
     "kube-vip": "networking",
     "nginx-ingress-controller": "networking",
-    # ---- security ----
+    # ---- security (인증/인가/시크릿/스캐너) ----
     "cert-manager": "security",
     "falco": "security",
     "kyverno": "security",
@@ -295,9 +297,22 @@ KNOWN_TOOLS: dict[str, str] = {
     "trivy": "security",
     "vault": "security",
     "oauth2-proxy": "security",
+    "oauth2": "security",
+    "oauth": "security",
+    "oidc": "security",
+    "oidc-proxy": "security",
+    "saml": "security",
+    "sso": "security",
+    "ldap": "security",
+    "openldap": "security",
+    "freeipa": "security",
     "dex": "security",
     "keycloak": "security",
-    "oidc-proxy": "security",
+    "authentik": "security",
+    "authelia": "security",
+    "okta": "security",
+    "auth0": "security",
+    "pingfederate": "security",
     "sealed-secrets": "security",
     "external-secrets": "security",
     "sops": "security",
@@ -314,6 +329,8 @@ KNOWN_TOOLS: dict[str, str] = {
     "spire": "security",
     "cert-bot": "security",
     "certbot": "security",
+    "sonarqube": "security",
+    "checkmarx": "security",
     # ---- registry ----
     "harbor": "registry",
     "nexus": "registry",
@@ -354,6 +371,49 @@ KNOWN_TOOLS: dict[str, str] = {
     "hyperv": "infrastructure",
     "kvm": "infrastructure",
     "libvirt": "infrastructure",
+    # ---- ml-ai (ML/AI 플랫폼) ----
+    "kubeflow": "ml-ai",
+    "kubeflow-pipelines": "ml-ai",
+    "kfp": "ml-ai",
+    "mlflow": "ml-ai",
+    "ray": "ml-ai",
+    "ray-cluster": "ml-ai",
+    "kserve": "ml-ai",
+    "kfserving": "ml-ai",
+    "seldon": "ml-ai",
+    "seldon-core": "ml-ai",
+    "jupyter": "ml-ai",
+    "jupyterhub": "ml-ai",
+    "jupyter-notebook": "ml-ai",
+    "jupyterlab": "ml-ai",
+    "bentoml": "ml-ai",
+    "triton": "ml-ai",
+    "nvidia-triton": "ml-ai",
+    "tritonserver": "ml-ai",
+    "mlrun": "ml-ai",
+    "feast": "ml-ai",
+    "determined": "ml-ai",
+    "polyaxon": "ml-ai",
+    "nemo": "ml-ai",
+    "dvc": "ml-ai",
+    "huggingface": "ml-ai",
+    "vllm": "ml-ai",
+    "ollama-server": "ml-ai",
+    "litellm": "ml-ai",
+    "langfuse": "ml-ai",
+    "tensorflow-serving": "ml-ai",
+    "torchserve": "ml-ai",
+    # ---- documentation (사내 위키/문서 시스템) ----
+    "confluence": "documentation",
+    "bookstack": "documentation",
+    "mediawiki": "documentation",
+    "docusaurus": "documentation",
+    "mkdocs": "documentation",
+    "outline": "documentation",
+    "wikijs": "documentation",
+    "dokuwiki": "documentation",
+    "gitbook": "documentation",
+    "backstage": "documentation",   # 사내 service catalog (실제로는 devops-tools 성격도 있음)
 }
 
 
@@ -375,12 +435,19 @@ def _build_classify_prompt(folder_name: str, files: list[str], context: str) -> 
     return f"""당신은 CNCF Landscape와 IT 인프라 분류 전문가입니다.
 
 [분류 규칙]
-1. 반드시 다음 카테고리 중 하나만 선택하세요 (그 외 값은 거부됩니다):
+1. 반드시 다음 카테고리 중 하나만 선택하세요 (그 외 값은 모두 거부되어 etc 로 떨어집니다):
    {", ".join(sorted(ALLOWED_CATEGORIES))}
 2. "k8s-cluster" 카테고리는 클러스터 자체 운영(kubeadm, etcd, CNI, CRI, upgrade)에만 사용합니다.
    k8s 위에 deployment.yaml 로 배포되는 워크로드(n8n, kong, grafana 등)는
    해당 도구의 본질적 기능 카테고리로 분류하세요.
-3. 분류 근거 우선순위: ① 폴더명에 포함된 도구명 → ② Chart.yaml 의 name/description
+3. "etc" 는 진짜로 IT 인프라/플랫폼 카테고리에 속하지 않는 경우에만 사용하세요
+   (예: 회의록, 개인 메모, 잡담). 도구/시스템은 항상 가장 가까운 실제 카테고리를 선택.
+4. 카테고리 매핑 힌트:
+   - 인증/인가 도구(SSO, LDAP, OAuth, OIDC, Keycloak 류) → security
+   - ML/AI 플랫폼(Kubeflow, MLflow, Jupyter, Ray, KServe 류) → ml-ai
+   - 사내 위키/문서 시스템(Confluence, Bookstack 류)       → documentation
+   - 이미지/아티팩트 저장소(Harbor, Nexus, Artifactory)    → registry
+5. 분류 근거 우선순위: ① 폴더명에 포함된 도구명 → ② Chart.yaml 의 name/description
    → ③ README 첫 단락 → ④ 파일 구성.
 
 {FEW_SHOT_EXAMPLES}
