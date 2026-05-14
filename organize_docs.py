@@ -48,6 +48,10 @@ MAX_README_CHARS = 2000          # 디스크 저장 직전 강제 truncate (LLM 
 CLASSIFY_TIMEOUT = 30
 README_TIMEOUT = 60
 
+# 재실행 옵션
+WIPE_EXISTING_README = True      # process_folder 시작 시 README.md + README_original.md 둘 다 삭제.
+                                  # → 완전 클린 상태에서 AI README 새로 생성. 평탄화 후 재실행에 권장.
+
 # 산출물
 CLASSIFICATION_LOG = "./classification_log.csv"   # 분류 결과 기록 (사후 검증용)
 INDEX_FILE_NAME = "INDEX.md"                       # TARGET_DIR 최상단에 생성
@@ -667,12 +671,23 @@ tags: [<쉼표로 3~5개>]
                 working_path = dest_path
                 status = "ok"
 
-            # 기존 README 백업 (모든 모드에서 일관되게)
-            existing = working_path / "README.md"
-            if existing.exists():
-                backup = working_path / "README_original.md"
-                if not backup.exists():
-                    existing.rename(backup)
+            # README 정리 정책:
+            #   WIPE_EXISTING_README=True  → 둘 다 삭제하고 새로 생성 (재실행 / 클린 슬레이트용)
+            #   WIPE_EXISTING_README=False → 첫 실행 시 사용자 원본을 README_original.md 로 백업
+            if WIPE_EXISTING_README:
+                for fname in ("README.md", "README_original.md"):
+                    p = working_path / fname
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception as e:
+                            logger.warning(f"   Could not delete {p}: {e}")
+            else:
+                existing = working_path / "README.md"
+                if existing.exists():
+                    backup = working_path / "README_original.md"
+                    if not backup.exists():
+                        existing.rename(backup)
 
             readme = await self.generate_readme(working_path, category)
             (working_path / "README.md").write_text(readme, encoding="utf-8")
