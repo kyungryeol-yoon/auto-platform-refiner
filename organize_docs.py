@@ -55,6 +55,12 @@ WIPE_EXISTING_README = True      # process_folder 시작 시 README.md + README_
 # 산출물
 CLASSIFICATION_LOG = "./classification_log.csv"   # 분류 결과 기록 (사후 검증용)
 INDEX_FILE_NAME = "INDEX.md"                       # TARGET_DIR 최상단에 생성
+DISCOVERED_CATEGORIES_FILE = "./.discovered_categories.json"
+# → LLM 이 ALLOWED_CATEGORIES 밖에서 제안한 새 카테고리를 누적 저장.
+#   다음 실행 때 prompt 에 주입돼 같은 종류 도구가 같은 카테고리로 수렴.
+
+# 동작 옵션
+ALLOW_NEW_CATEGORIES = True       # False → 미매칭 시 무조건 etc (엄격 모드)
 # =================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -214,6 +220,9 @@ KNOWN_TOOLS: dict[str, str] = {
     "k9s": "monitoring",
     "lens": "monitoring",
     "pyroscope": "monitoring",
+    "alloy": "monitoring",            # Grafana Alloy (OTel-based collector)
+    "grafana-alloy": "monitoring",
+    "kore-board": "monitoring",       # k8s 운영 보드 (사내 자주 쓰는 OSS)
     # 전통적인 인프라 모니터링
     "zabbix": "monitoring",
     "zabbix-agent": "monitoring",
@@ -251,6 +260,7 @@ KNOWN_TOOLS: dict[str, str] = {
     "loki": "logging",
     "promtail": "logging",
     "opensearch": "logging",
+    "opendistro": "logging",          # OpenDistro for Elasticsearch (AWS fork, OpenSearch 전신)
     "graylog": "logging",
     "splunk": "logging",
     "filebeat": "logging",
@@ -340,6 +350,10 @@ KNOWN_TOOLS: dict[str, str] = {
     "azure-disk-csi": "storage",
     "vsphere-csi": "storage",
     "hostpath-csi": "storage",
+    "storageclass": "storage",        # k8s 네이티브 리소스 정의 모음
+    "storage-class": "storage",
+    "persistent-volume": "storage",
+    "pv-provisioner": "storage",
     # ---- networking ----
     "cilium": "networking",
     "calico": "networking",
@@ -412,7 +426,7 @@ KNOWN_TOOLS: dict[str, str] = {
     "quay": "registry",
     "docker-registry": "registry",
     "distribution": "registry",
-    # ---- k8s-cluster (클러스터 자체 운영) ----
+    # ---- k8s-cluster (클러스터 자체 운영 + 관리 플랫폼 + 컨테이너 런타임) ----
     "kubeadm": "k8s-cluster",
     "kubespray": "k8s-cluster",
     "rancher": "k8s-cluster",
@@ -435,6 +449,13 @@ KNOWN_TOOLS: dict[str, str] = {
     "containerd": "k8s-cluster",
     "cri-o": "k8s-cluster",
     "crio": "k8s-cluster",
+    "docker": "k8s-cluster",          # 컨테이너 런타임/엔진
+    "dockerd": "k8s-cluster",
+    "docker-compose": "k8s-cluster",
+    "podman": "k8s-cluster",
+    "kubesphere": "k8s-cluster",      # k8s 관리 플랫폼 UI
+    "portainer": "k8s-cluster",
+    "lens-desktop": "k8s-cluster",
     # ---- infrastructure (IaaS 레이어) ----
     "openstack": "infrastructure",
     "vmware": "infrastructure",
@@ -476,6 +497,7 @@ KNOWN_TOOLS: dict[str, str] = {
     "langfuse": "ml-ai",
     "tensorflow-serving": "ml-ai",
     "torchserve": "ml-ai",
+    "ollama": "ml-ai",                # LLM 서빙 (※ 우리 코드의 fallback 모드 'ollama' 와는 무관)
     # ---- documentation (사내 위키/문서 시스템 + 이슈 트래커 + 협업) ----
     "confluence": "documentation",
     "bookstack": "documentation",
@@ -505,41 +527,59 @@ KNOWN_TOOLS: dict[str, str] = {
 
 FEW_SHOT_EXAMPLES = """[분류 예시]
 - 폴더명 "n8n-v1.0", 파일 ["deployment.yaml", "service.yaml"]
-  → {"category": "devops-tools", "reason": "n8n은 워크플로 자동화 도구 (deployment.yaml은 단지 k8s 배포 방식)"}
+  → {"category": "devops-tools", "is_new": false, "reason": "n8n은 워크플로 자동화 도구"}
 - 폴더명 "kong-v2.0.1", 파일 ["Chart.yaml", "values.yaml"]
-  → {"category": "api-gateway", "reason": "Kong은 대표적인 API Gateway"}
+  → {"category": "api-gateway", "is_new": false, "reason": "Kong은 대표적인 API Gateway"}
 - 폴더명 "k8s-upgrade-v1.24-to-v1.26", 파일 ["upgrade.md"]
-  → {"category": "k8s-cluster", "reason": "클러스터 자체 업그레이드 가이드"}
-- 폴더명 "prometheus-stack", 파일 ["values.yaml"]
-  → {"category": "monitoring", "reason": "Prometheus 모니터링 스택"}
-- 폴더명 "harbor-registry", 파일 ["values.yaml"]
-  → {"category": "registry", "reason": "Harbor는 컨테이너 이미지 레지스트리"}
+  → {"category": "k8s-cluster", "is_new": false, "reason": "클러스터 자체 업그레이드 가이드"}
+- 폴더명 "chip-stress-test", 파일 ["scripts/", "results/"]
+  → {"category": "load-testing", "is_new": true, "reason": "표준 카테고리에 부하/스트레스 테스트 없음 - 새 카테고리 제안"}
+- 폴더명 "kore-board", 파일 ["values.yaml"]
+  → {"category": "k8s-dashboard", "is_new": true, "reason": "k8s 운영 대시보드 UI - 기존 monitoring 보단 별도 분류가 검색에 유리"}
 """
 
+# 새 카테고리 이름 검증: 영문 소문자로 시작, 소문자/숫자/하이픈만, 3~30자
+_NEW_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9\-]{2,29}$")
 
-def _build_classify_prompt(folder_name: str, files: list[str], context: str) -> str:
+
+def _build_classify_prompt(
+    folder_name: str,
+    files: list[str],
+    context: str,
+    discovered: set[str] | None = None,
+) -> str:
+    discovered = discovered or set()
+    discovered_str = ", ".join(sorted(discovered)) if discovered else "(아직 없음)"
+    allow_new_section = (
+        "3. 위에 적합한 것이 정말 없으면, 새 카테고리를 제안할 수 있습니다.\n"
+        "   - 형식: 영문 소문자 시작, 소문자/숫자/하이픈만, 3~30자 (예: load-testing, data-pipeline)\n"
+        "   - 도구명 자체보다 의미 있는 분류명 (chip-stress → load-testing)\n"
+        "   - 너무 좁지도 너무 넓지도 않게.\n"
+        f"   - 이전에 자동 생성된 카테고리(있으면 우선 사용): {discovered_str}\n"
+        if ALLOW_NEW_CATEGORIES else
+        "3. 표준 카테고리 외의 값은 모두 etc 로 강등됩니다.\n"
+    )
     return f"""당신은 CNCF Landscape와 IT 인프라 분류 전문가입니다.
 
 [분류 규칙]
-1. 반드시 다음 카테고리 중 하나만 선택하세요 (그 외 값은 모두 거부되어 etc 로 떨어집니다):
+1. 우선 다음 표준 카테고리 중에서 가장 적합한 것을 선택하세요:
    {", ".join(sorted(ALLOWED_CATEGORIES))}
-2. "k8s-cluster" 카테고리는 클러스터 자체 운영(kubeadm, etcd, CNI, CRI, upgrade)에만 사용합니다.
-   k8s 위에 deployment.yaml 로 배포되는 워크로드(n8n, kong, grafana 등)는
-   해당 도구의 본질적 기능 카테고리로 분류하세요.
-3. "etc" 는 진짜로 IT 인프라/플랫폼 카테고리에 속하지 않는 경우에만 사용하세요
-   (예: 회의록, 개인 메모, 잡담). 도구/시스템은 항상 가장 가까운 실제 카테고리를 선택.
-4. 카테고리 매핑 힌트:
-   - 인증/인가 도구(SSO, LDAP, OAuth, OIDC, Keycloak 류) → security
-   - ML/AI 플랫폼(Kubeflow, MLflow, Jupyter, Ray, KServe 류) → ml-ai
-   - 사내 위키/문서 시스템(Confluence, Bookstack 류)       → documentation
-   - 이미지/아티팩트 저장소(Harbor, Nexus, Artifactory)    → registry
-5. 분류 근거 우선순위: ① 폴더명에 포함된 도구명 → ② Chart.yaml 의 name/description
+2. "k8s-cluster" 는 클러스터 자체 운영(kubeadm, etcd, CNI, CRI, upgrade)에만 사용.
+   k8s 위에 deployment.yaml 로 배포되는 워크로드는 도구의 본질적 기능 카테고리로 분류.
+{allow_new_section}4. 카테고리 매핑 힌트:
+   - 인증/인가(SSO, LDAP, OAuth, OIDC, Keycloak)         → security
+   - ML/AI 플랫폼(Kubeflow, MLflow, Jupyter, Ray, Ollama) → ml-ai
+   - 사내 위키/이슈 트래커(Confluence, Jira, Bookstack)  → documentation
+   - 이미지/아티팩트 저장소(Harbor, Nexus, Artifactory)  → registry
+5. "etc" 는 진짜 인프라/플랫폼이 아닐 때만 (회의록, 개인 메모 등).
+   도구/시스템은 항상 가장 가까운 카테고리를 선택하거나 새 카테고리를 제안하세요.
+6. 분류 근거 우선순위: ① 폴더명 도구명 → ② Chart.yaml name/description
    → ③ README 첫 단락 → ④ 파일 구성.
 
 {FEW_SHOT_EXAMPLES}
 
 응답은 반드시 아래 JSON 형식 한 줄로만 답하세요:
-{{"category": "<카테고리>", "reason": "<한 줄 근거>"}}
+{{"category": "<카테고리>", "is_new": <true|false>, "reason": "<한 줄 근거>"}}
 
 [데이터]
 - 폴더명: {folder_name}
@@ -563,6 +603,8 @@ class DocOrganizer:
         self._known_tool_keys = sorted(KNOWN_TOOLS.keys(), key=len, reverse=True)
         # 분류 로그 (run 종료 시 CSV 로 flush)
         self._log_rows: list[dict[str, str]] = []
+        # LLM 이 동적 제안한 카테고리 (영구 저장 → 다음 run 에 prompt 로 주입)
+        self.discovered: set[str] = self._load_discovered_categories()
 
     # ---------- LLM callers ----------
     async def _call_company(
@@ -687,20 +729,62 @@ class DocOrganizer:
     def _parse_category(self, raw: str | None) -> tuple[str, str]:
         if not raw:
             return "etc", "llm-empty-response"
-        # JSON 객체만 추출 (모델이 코드펜스/잡담을 붙이는 경우 대비)
         m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         payload = m.group(0) if m else raw
         try:
             obj = json.loads(payload)
             cat = str(obj.get("category", "etc")).lower().strip().replace(" ", "-")
             reason = str(obj.get("reason", "")).strip()
-            if cat not in ALLOWED_CATEGORIES:
-                logger.warning(f"   LLM returned unknown category '{cat}', falling back to etc")
-                return "etc", f"llm-unknown:{cat}"
-            return cat, f"llm:{reason}" if reason else "llm"
+            is_new_flag = bool(obj.get("is_new", False))
+
+            # 1) 표준 카테고리 또는 이미 발견된 새 카테고리는 그대로 수용
+            if cat in ALLOWED_CATEGORIES or cat in self.discovered:
+                return cat, f"llm:{reason}" if reason else "llm"
+
+            # 2) ALLOW_NEW_CATEGORIES + 이름 검증 통과 시 새 카테고리로 채택
+            if (
+                ALLOW_NEW_CATEGORIES
+                and cat != "etc"
+                and _NEW_CATEGORY_RE.match(cat)
+            ):
+                self.discovered.add(cat)
+                logger.info(f"   [new category] {cat} ← {reason or '(no reason)'}")
+                return cat, f"llm-new:{reason}" if reason else "llm-new"
+
+            # 3) 이름 검증 실패 → etc
+            logger.warning(
+                f"   LLM returned invalid category '{cat}' (is_new={is_new_flag}); falling back to etc"
+            )
+            return "etc", f"llm-unknown:{cat}"
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"   Failed to parse classification JSON ({e}): {raw[:200]!r}")
             return "etc", "llm-parse-error"
+
+    def _load_discovered_categories(self) -> set[str]:
+        p = Path(DISCOVERED_CATEGORIES_FILE)
+        if not p.exists():
+            return set()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return {str(c).lower() for c in data if _NEW_CATEGORY_RE.match(str(c).lower())}
+        except Exception as e:
+            logger.warning(f"Failed to load discovered categories: {e}")
+            return set()
+
+    def _save_discovered_categories(self) -> None:
+        if not self.discovered:
+            return
+        try:
+            Path(DISCOVERED_CATEGORIES_FILE).write_text(
+                json.dumps(sorted(self.discovered), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(
+                f"Discovered categories saved: {len(self.discovered)} entries → "
+                f"{DISCOVERED_CATEGORIES_FILE}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save discovered categories: {e}")
 
     async def classify_folder(self, folder: Path) -> tuple[str, str]:
         # 1) Rule-based 우선
@@ -715,7 +799,7 @@ class DocOrganizer:
             logger.warning(f"   Cannot list {folder}: {e}")
             files = []
         context = self._gather_classification_context(folder)
-        prompt = _build_classify_prompt(folder.name, files, context)
+        prompt = _build_classify_prompt(folder.name, files, context, self.discovered)
         raw = await self.call_llm(prompt, use_json=True, timeout=CLASSIFY_TIMEOUT)
         return self._parse_category(raw)
 
@@ -892,9 +976,10 @@ tags: [<쉼표로 3~5개>]
 
     def _write_index_md(self, target: Path) -> None:
         """TARGET_DIR/INDEX.md 생성 — 전체 프로젝트 카탈로그."""
+        valid_cats = ALLOWED_CATEGORIES | self.discovered
         entries: list[tuple[str, str, str, str]] = []  # (category, project, version, location)
         for cat_dir in sorted(target.iterdir()):
-            if not cat_dir.is_dir() or cat_dir.name.lower() not in ALLOWED_CATEGORIES:
+            if not cat_dir.is_dir() or cat_dir.name.lower() not in valid_cats:
                 continue
             for proj_dir in sorted(cat_dir.iterdir()):
                 if not proj_dir.is_dir():
@@ -953,12 +1038,13 @@ tags: [<쉼표로 3~5개>]
             logger.error(f"Target directory does not exist: {TARGET_DIR}")
             return
 
-        # 이미 카테고리 폴더로 이동된 항목은 건너뜀
+        # 이미 카테고리 폴더로 이동된 항목은 건너뜀 (표준 + 이전에 발견한 카테고리 모두)
+        valid_cats = ALLOWED_CATEGORIES | self.discovered
         folders = [
             f for f in target.iterdir()
             if f.is_dir()
             and not f.name.startswith((".", "_"))
-            and f.name.lower() not in ALLOWED_CATEGORIES
+            and f.name.lower() not in valid_cats
         ]
         if not folders:
             logger.info("No folders to process.")
@@ -968,8 +1054,9 @@ tags: [<쉼표로 3~5개>]
         for folder in folders:
             await self.process_folder(folder, target)
 
-        # 산출물: 분류 로그(CSV) + 최상위 카탈로그(INDEX.md)
+        # 산출물: 분류 로그(CSV) + 최상위 카탈로그(INDEX.md) + 발견 카테고리 영속화
         self._write_classification_log()
+        self._save_discovered_categories()
         self._write_index_md(target)
         logger.info("All tasks completed.")
 
