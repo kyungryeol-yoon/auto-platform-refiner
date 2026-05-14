@@ -61,6 +61,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _validate_headers(headers: dict | None, var_name: str) -> dict[str, str] | None:
+    """헤더 dict 의 값이 모두 문자열인지 검증. 잘못된 값 발견 시 즉시 fail-fast."""
+    if not headers:
+        return None
+    for k, v in headers.items():
+        if not isinstance(v, (str, bytes)):
+            raise TypeError(
+                f"{var_name}['{k}'] 값은 문자열이어야 합니다. 받은 값: {type(v).__name__} = {v!r}\n"
+                f"올바른 예: {var_name} = {{'X-Tenant-Id': 'platform-team', "
+                f"'Authorization': 'Bearer xxx'}}"
+            )
+    return dict(headers)
+
+
 # ---------- 카테고리 enum ----------
 # LLM 이 이 집합 밖의 값을 내면 "etc" 로 강등됨.
 ALLOWED_CATEGORIES = {
@@ -116,6 +130,11 @@ KNOWN_TOOLS: dict[str, str] = {
     "argo-workflows": "ci-cd",
     "argo-rollouts": "ci-cd",
     "argo-events": "ci-cd",
+    "argo": "ci-cd",                 # 위 변형들에 매칭 안 되는 "argo-*" 폴더 fallback
+    "knative": "ci-cd",
+    "knative-serving": "ci-cd",
+    "kubevela": "ci-cd",
+    "vela": "ci-cd",
     "jenkins": "ci-cd",
     "jenkins-x": "ci-cd",
     "tekton": "ci-cd",
@@ -158,7 +177,13 @@ KNOWN_TOOLS: dict[str, str] = {
     "pulumi": "devops-tools",
     "crossplane": "devops-tools",
     "kustomize": "devops-tools",
+    "helm": "devops-tools",
     "helmfile": "devops-tools",
+    "skaffold": "devops-tools",
+    "tilt": "devops-tools",
+    "garden": "devops-tools",
+    "okteto": "devops-tools",
+    "devspace": "devops-tools",
     # ---- monitoring (메트릭/APM/트레이싱) ----
     "prometheus": "monitoring",
     "grafana": "monitoring",
@@ -300,6 +325,21 @@ KNOWN_TOOLS: dict[str, str] = {
     "juicefs": "storage",
     "alluxio": "storage",
     "portworx": "storage",
+    # CSI 드라이버 패밀리 (Container Storage Interface)
+    "csi": "storage",
+    "csi-driver": "storage",
+    "csi-snapshotter": "storage",
+    "csi-resizer": "storage",
+    "csi-attacher": "storage",
+    "csi-provisioner": "storage",
+    "nfs-csi": "storage",
+    "smb-csi": "storage",
+    "aws-ebs-csi": "storage",
+    "aws-efs-csi": "storage",
+    "gcp-pd-csi": "storage",
+    "azure-disk-csi": "storage",
+    "vsphere-csi": "storage",
+    "hostpath-csi": "storage",
     # ---- networking ----
     "cilium": "networking",
     "calico": "networking",
@@ -315,6 +355,12 @@ KNOWN_TOOLS: dict[str, str] = {
     "ovn": "networking",
     "kube-vip": "networking",
     "nginx-ingress-controller": "networking",
+    "external-dns": "networking",
+    "externaldns": "networking",
+    "caddy": "networking",
+    "aws-load-balancer-controller": "networking",
+    "aws-lb-controller": "networking",
+    "ingress-controller": "networking",
     # ---- security (인증/인가/시크릿/스캐너) ----
     "cert-manager": "security",
     "falco": "security",
@@ -511,7 +557,7 @@ class DocOrganizer:
         self.client = AsyncOpenAI(
             api_key=COMPANY_API_KEY,
             base_url=COMPANY_API_BASE,
-            default_headers=COMPANY_DEFAULT_HEADERS or None,
+            default_headers=_validate_headers(COMPANY_DEFAULT_HEADERS, "COMPANY_DEFAULT_HEADERS"),
         )
         # word-boundary 매칭용으로 키워드를 길이 내림차순 정렬해 둠
         self._known_tool_keys = sorted(KNOWN_TOOLS.keys(), key=len, reverse=True)

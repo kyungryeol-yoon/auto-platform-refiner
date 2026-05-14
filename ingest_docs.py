@@ -79,6 +79,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _validate_headers(headers: dict | None, var_name: str) -> dict[str, str] | None:
+    """헤더 dict 값이 모두 문자열인지 검증. 잘못된 값 발견 시 즉시 fail-fast."""
+    if not headers:
+        return None
+    for k, v in headers.items():
+        if not isinstance(v, (str, bytes)):
+            raise TypeError(
+                f"{var_name}['{k}'] 값은 문자열이어야 합니다. 받은 값: {type(v).__name__} = {v!r}\n"
+                f"올바른 예: {var_name} = {{'X-Tenant-Id': 'platform-team', "
+                f"'Authorization': 'Bearer xxx'}}"
+            )
+    return dict(headers)
+
+
 # ================= Vector store backends =================
 class VectorStore(Protocol):
     """공통 인터페이스. 새 백엔드 추가 시 upsert 만 구현하면 됨."""
@@ -103,7 +117,7 @@ class ChromaStore:
             host=CHROMA_HOST,
             port=CHROMA_PORT,
             ssl=CHROMA_SSL,
-            headers=CHROMA_HEADERS or None,
+            headers=_validate_headers(CHROMA_HEADERS, "CHROMA_HEADERS"),
         )
         self.collection = client.get_or_create_collection(CHROMA_COLLECTION)
         scheme = "https" if CHROMA_SSL else "http"
@@ -208,7 +222,7 @@ class DocIngestor:
         self.embed = AsyncOpenAI(
             base_url=EMBEDDING_API_BASE,
             api_key=EMBEDDING_API_KEY,
-            default_headers=EMBEDDING_DEFAULT_HEADERS or None,
+            default_headers=_validate_headers(EMBEDDING_DEFAULT_HEADERS, "EMBEDDING_DEFAULT_HEADERS"),
         )
         self.sem = asyncio.Semaphore(EMBED_CONCURRENCY)
 
