@@ -189,6 +189,33 @@ KNOWN_TOOLS: dict[str, str] = {
     "k9s": "monitoring",
     "lens": "monitoring",
     "pyroscope": "monitoring",
+    # 전통적인 인프라 모니터링
+    "zabbix": "monitoring",
+    "zabbix-agent": "monitoring",
+    "zabbix-server": "monitoring",
+    "zabbix-proxy": "monitoring",
+    "nagios": "monitoring",
+    "icinga": "monitoring",
+    "icinga2": "monitoring",
+    "centreon": "monitoring",
+    "checkmk": "monitoring",
+    "check-mk": "monitoring",
+    "sensu": "monitoring",
+    "cacti": "monitoring",
+    "munin": "monitoring",
+    "observium": "monitoring",
+    "librenms": "monitoring",
+    "netdata": "monitoring",
+    # APM / 트레이싱
+    "pinpoint": "monitoring",
+    "skywalking": "monitoring",
+    "elastic-apm": "monitoring",
+    "scouter": "monitoring",
+    "glowroot": "monitoring",
+    "tempo": "monitoring",
+    "mimir": "monitoring",
+    "uptrace": "monitoring",
+    "uptime-kuma": "monitoring",
     # ---- logging ----
     "elasticsearch": "logging",
     "kibana": "logging",
@@ -403,7 +430,7 @@ KNOWN_TOOLS: dict[str, str] = {
     "langfuse": "ml-ai",
     "tensorflow-serving": "ml-ai",
     "torchserve": "ml-ai",
-    # ---- documentation (사내 위키/문서 시스템) ----
+    # ---- documentation (사내 위키/문서 시스템 + 이슈 트래커 + 협업) ----
     "confluence": "documentation",
     "bookstack": "documentation",
     "mediawiki": "documentation",
@@ -413,7 +440,20 @@ KNOWN_TOOLS: dict[str, str] = {
     "wikijs": "documentation",
     "dokuwiki": "documentation",
     "gitbook": "documentation",
-    "backstage": "documentation",   # 사내 service catalog (실제로는 devops-tools 성격도 있음)
+    "backstage": "documentation",   # 사내 service catalog
+    # 이슈 트래커 / 협업
+    "jira": "documentation",
+    "redmine": "documentation",
+    "mantis": "documentation",
+    "mattermost": "documentation",
+    "rocket-chat": "documentation",
+    "rocketchat": "documentation",
+    "discourse": "documentation",
+    # 형상관리/SCM (CI/CD 인접이지만 도구 자체는 문서/협업으로)
+    "gitlab": "ci-cd",
+    "bitbucket": "ci-cd",
+    "gerrit": "ci-cd",
+    "github-enterprise": "ci-cd",
 }
 
 
