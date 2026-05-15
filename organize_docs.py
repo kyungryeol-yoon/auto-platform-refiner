@@ -20,7 +20,14 @@ from openai import AsyncOpenAI
 # ================= CONFIGURATION =================
 TARGET_DIR = r"./test_docs"
 
-# 동작 모드
+# 동작 방식 (high-level operation)
+#   "organize"    : 분류 + 폴더 이동 + README 생성 (전체 파이프라인)
+#   "readme-only" : 현재 분류 구조는 그대로 두고, README 만 (재)생성.
+#                   - 영어로 생성된 README 를 한국어로 다시 만들 때
+#                   - 사용자가 직접 분류해 둔 폴더에 README 만 채울 때
+ACTION = "organize"
+
+# LLM 백엔드 모드
 #   "hybrid"  : 사내 API 우선, 실패 시 Ollama
 #   "company" : 사내 API 만 사용
 #   "ollama"  : 로컬 Ollama 만 사용
@@ -1100,12 +1107,69 @@ tags: [gateway, kong, api]
         except Exception as e:
             logger.warning(f"Failed to write INDEX.md: {e}")
 
-    async def run(self) -> None:
-        target = Path(TARGET_DIR)
-        if not target.exists():
-            logger.error(f"Target directory does not exist: {TARGET_DIR}")
+    # ---------- README 단독 재생성 ----------
+    async def regenerate_readme_for(self, folder: Path, category: str, target: Path) -> None:
+        """한 프로젝트 폴더의 README 만 재생성. 폴더 위치는 그대로 둠."""
+        dest_str = (target / category / folder.name).as_posix()
+        status = "error"
+        try:
+            if WIPE_EXISTING_README:
+                for fname in ("README.md", "README_original.md"):
+                    p = folder / fname
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception as e:
+                            logger.warning(f"   Could not delete {p}: {e}")
+            readme = await self.generate_readme(folder, category)
+            (folder / "README.md").write_text(readme, encoding="utf-8")
+            logger.info(f"[{category}/{folder.name}] README regenerated")
+            status = "readme-ok"
+        except Exception as e:
+            logger.error(f"Error regenerating README for {folder.name}: {e}")
+            status = f"error:{type(e).__name__}"
+        finally:
+            self._log_rows.append({
+                "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+                "folder": folder.name,
+                "category": category,
+                "source": "readme-only",
+                "destination": dest_str,
+                "status": status,
+            })
+
+    async def _run_readme_only(self, target: Path) -> None:
+        """현재 분류 구조(target/<category>/<project>/)를 그대로 두고 README 만 재생성.
+
+        - ALLOWED_CATEGORIES + self.discovered 외에 사용자가 수동으로 만든 카테고리 폴더도
+          포함 (2단계 폴더 = 카테고리, 3단계 폴더 = 프로젝트).
+        - 카테고리 이름은 부모 폴더 이름에서 그대로 가져옴.
+        """
+        projects: list[tuple[str, Path]] = []
+        for cat_dir in sorted(target.iterdir()):
+            if not cat_dir.is_dir() or cat_dir.name.startswith((".", "_")):
+                continue
+            cat_name = cat_dir.name.lower()
+            # 사용자가 수동으로 만든 카테고리 폴더도 discovered 에 등록 →
+            # 차후 organize 실행 때 스킵 + INDEX.md 에 반영
+            if (cat_name not in ALLOWED_CATEGORIES
+                    and _NEW_CATEGORY_RE.match(cat_name)):
+                self.discovered.add(cat_name)
+            for proj_dir in sorted(cat_dir.iterdir()):
+                if not proj_dir.is_dir() or proj_dir.name.startswith((".", "_")):
+                    continue
+                projects.append((cat_dir.name, proj_dir))
+
+        if not projects:
+            logger.info("No project folders found under <TARGET_DIR>/<category>/<project>/.")
             return
 
+        logger.info(f"README-only mode — {len(projects)} projects under {target}")
+        for category, folder in projects:
+            await self.regenerate_readme_for(folder, category, target)
+
+    # ---------- 분류 + 이동 + README ----------
+    async def _run_organize(self, target: Path) -> None:
         # 이미 카테고리 폴더로 이동된 항목은 건너뜀 (표준 + 이전에 발견한 카테고리 모두)
         valid_cats = ALLOWED_CATEGORIES | self.discovered
         folders = [
@@ -1118,11 +1182,25 @@ tags: [gateway, kong, api]
             logger.info("No folders to process.")
             return
 
-        logger.info(f"Starting (mode={self.mode}) — {len(folders)} folders")
+        logger.info(f"Organize mode (llm={self.mode}) — {len(folders)} folders")
         for folder in folders:
             await self.process_folder(folder, target)
 
-        # 산출물: 분류 로그(CSV) + 최상위 카탈로그(INDEX.md) + 발견 카테고리 영속화
+    # ---------- 진입점 ----------
+    async def run(self) -> None:
+        target = Path(TARGET_DIR)
+        if not target.exists():
+            logger.error(f"Target directory does not exist: {TARGET_DIR}")
+            return
+
+        if ACTION == "readme-only":
+            await self._run_readme_only(target)
+        elif ACTION == "organize":
+            await self._run_organize(target)
+        else:
+            raise ValueError(f"Unknown ACTION: {ACTION!r} (expected 'organize' | 'readme-only')")
+
+        # 공통 산출물: 분류 로그(CSV) + 최상위 카탈로그(INDEX.md) + 발견 카테고리 영속화
         self._write_classification_log()
         self._save_discovered_categories()
         self._write_index_md(target)
