@@ -613,10 +613,15 @@ class DocOrganizer:
         use_json: bool,
         max_tokens: int | None,
         timeout: int,
+        system: str | None = None,
     ) -> str | None:
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         kwargs: dict = {
             "model": COMPANY_API_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": LLM_TEMPERATURE,
             "timeout": timeout,
         }
@@ -640,10 +645,20 @@ class DocOrganizer:
             logger.warning(f"Company API failed: {e}")
             return None
 
-    async def _call_ollama(self, prompt: str, use_json: bool, timeout: int) -> str | None:
+    async def _call_ollama(
+        self,
+        prompt: str,
+        use_json: bool,
+        timeout: int,
+        system: str | None = None,
+    ) -> str | None:
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": OLLAMA_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "stream": False,
         }
         if use_json:
@@ -666,15 +681,16 @@ class DocOrganizer:
         use_json: bool = False,
         max_tokens: int | None = None,
         timeout: int = 60,
+        system: str | None = None,
     ) -> str | None:
         if self.mode == "ollama":
-            return await self._call_ollama(prompt, use_json, timeout)
-        result = await self._call_company(prompt, use_json, max_tokens, timeout)
+            return await self._call_ollama(prompt, use_json, timeout, system=system)
+        result = await self._call_company(prompt, use_json, max_tokens, timeout, system=system)
         if result is not None:
             return result
         if self.mode == "hybrid":
             logger.info("   Falling back to Ollama...")
-            return await self._call_ollama(prompt, use_json, timeout)
+            return await self._call_ollama(prompt, use_json, timeout, system=system)
         return None
 
     # ---------- Classification ----------
@@ -816,6 +832,20 @@ class DocOrganizer:
             head = head[:nl]
         return head.rstrip() + "\n\n<!-- truncated -->\n"
 
+    @staticmethod
+    def _korean_ratio(text: str) -> float:
+        """본문의 한국어(한글 음절) 비율을 계산.
+        프론트매터/코드/기술 식별자를 제외한 본문 알파벳 기준."""
+        # Front-matter 제거
+        body = re.sub(r"^---.*?---\s*\n", "", text, count=1, flags=re.DOTALL)
+        # 인라인/블록 코드 제거 (영문 식별자가 많음)
+        body = re.sub(r"`[^`]*`", "", body)
+        body = re.sub(r"```[\s\S]*?```", "", body)
+        hangul = sum(1 for c in body if "가" <= c <= "힣")
+        latin  = sum(1 for c in body if ("a" <= c <= "z") or ("A" <= c <= "Z"))
+        total = hangul + latin
+        return (hangul / total) if total else 1.0
+
     async def generate_readme(self, folder: Path, category: str) -> str:
         snippets: list[str] = []
         for fname in ("Chart.yaml", "values.yaml", "deployment.yaml", "README.md", "README.txt"):
@@ -832,58 +862,93 @@ class DocOrganizer:
 
         # RAG 친화: Front-matter 는 ingest_docs.py 가 파싱할 수 있는 정확한 형식으로 강제.
         # 본문은 임베딩 대상이 되므로 짧고 키워드 밀도가 높아야 함.
-        prompt = f"""당신은 사내 인프라 문서화 전문가입니다.
-아래 프로젝트의 README.md 를 RAG 검색용으로 작성하세요.
+        system_msg = (
+            "당신은 한국어로만 답변하는 한국 사내 인프라 문서 작성 전문가입니다. "
+            "입력 자료가 영어/중국어/일본어 등 어떤 언어로 와도 출력은 반드시 100% 한국어로만 "
+            "작성합니다. 영어 문장은 절대 쓰지 마세요. 단, 다음은 원문 그대로 두세요: "
+            "도구명(Kong, Prometheus 등), 버전번호(v1.2.3), 포트(8080), URL, "
+            "이미지명(nginx:1.25), 설정키(replicaCount), 파일경로(/etc/...). "
+            "이 식별자들도 그 뒤에는 반드시 한국어 설명을 붙이세요."
+        )
 
-[엄수 사항]
-- **모든 설명문은 반드시 한국어로 작성**. 입력 자료가 영어/중국어/일본어여도
-  의미를 한국어로 번역/의역해서 작성하세요.
-  예외: 도구명·버전번호·포트·이미지명·설정키 같은 기술 식별자는 원문 유지.
-- 전체 1200자 이내 (한글 기준). 절대 초과 금지.
-- YAML 원문 복사 금지. 핵심 값(포트, 이미지, 엔드포인트)만 한국어로 한 줄씩 요약.
-- 출력은 아래 템플릿을 그대로 따르세요. 섹션을 추가/생략하지 마세요.
-
-[출력 템플릿]
+        example = """[완전한 출력 예시 — 이 형식과 어조 그대로 따라하세요]
 ---
-category: {category}
-project: <도구명 소문자>
-version: <감지된 버전 또는 unknown>
-location: {folder.as_posix()}
-tags: [<쉼표로 3~5개, 영문 식별자 우선>]
+category: api-gateway
+project: kong
+version: 2.0.1
+location: api-gateway/kong-v2.0.1
+tags: [gateway, kong, api]
 ---
 
-# <도구명> <버전>
+# Kong 2.0.1
 
-**요약**: <한 문장 한국어 요약. 이 프로젝트가 무엇이고 왜 쓰는지>
+**요약**: Kong은 마이크로서비스 환경에서 API 트래픽을 라우팅하고 인증·속도 제한을 처리하는 오픈소스 API Gateway입니다.
 
-**검색 키워드**: <쉼표로 5개. 한국어 + 영문 식별자 혼합 가능>
+**검색 키워드**: API 게이트웨이, Kong, 인증, 라우팅, gateway
 
 ## 기술 스택
-- <기술명>: <한국어로 한 줄 설명>
-- <기술명>: <한국어로 한 줄 설명>
+- Kong v2.0.1: Nginx/OpenResty 기반의 API Gateway 엔진으로 플러그인 확장이 가능합니다.
+- PostgreSQL 12: Kong의 설정 정보를 저장하는 백엔드 데이터베이스입니다.
 
 ## 핵심 설정
-- <설정 항목>: <한국어로 의미와 값 설명>
-- <설정 항목>: <한국어로 의미와 값 설명>
+- proxy.port: 8000 — 외부 클라이언트가 접근하는 프록시 포트입니다.
+- admin.enabled: false — 운영 환경에서는 관리자 API를 비활성화합니다.
+"""
+
+        prompt = f"""아래 프로젝트의 README.md 를 RAG 검색용으로 작성하세요.
+
+[엄수 사항]
+- **모든 문장은 반드시 한국어**. 영어 문장 금지.
+- 전체 1200자 이내. 절대 초과 금지.
+- YAML 원문 복사 금지. 핵심 값(포트, 이미지, 엔드포인트)만 한국어로 한 줄씩 요약.
+- 아래 [완전한 출력 예시] 의 구조·어조·문체를 그대로 따라하세요.
+  (섹션 헤더, **요약**, **검색 키워드**, ## 기술 스택, ## 핵심 설정 동일)
+
+{example}
 
 [입력 데이터]
 - 폴더명: {folder.name}
 - 카테고리: {category}
 - 설정 발췌:
 {content_snippet}
-"""
+
+위 예시와 동일한 구조로 한국어 README 를 작성하세요. Front-matter 부터 시작."""
+
         result = await self.call_llm(
             prompt,
             use_json=False,
             max_tokens=MAX_README_TOKENS,
             timeout=README_TIMEOUT,
+            system=system_msg,
         )
+
+        # 한국어 비율 검증 — 영어가 너무 많으면 1회 재시도
+        if result and self._korean_ratio(result) < 0.5:
+            ratio = self._korean_ratio(result)
+            logger.warning(
+                f"   README mostly non-Korean (hangul ratio={ratio:.0%}), retrying..."
+            )
+            retry_prompt = (
+                "⚠️ 이전 응답에 영어 문장이 포함되어 있었습니다. **반드시 100% 한국어로만** "
+                "다시 작성하세요. 도구명·버전·포트 같은 식별자만 영문 허용, 나머지 설명은 모두 한글.\n\n"
+                + prompt
+            )
+            retry = await self.call_llm(
+                retry_prompt,
+                use_json=False,
+                max_tokens=MAX_README_TOKENS,
+                timeout=README_TIMEOUT,
+                system=system_msg,
+            )
+            if retry and self._korean_ratio(retry) > self._korean_ratio(result):
+                result = retry
+
         if result:
             return self._truncate_readme(result)
         return (
             f"---\ncategory: {category}\nproject: {folder.name}\n"
             f"version: unknown\nlocation: {folder.as_posix()}\ntags: []\n---\n"
-            f"# {folder.name}\n\n**Summary**: 자동 생성 실패 — 수동 작성 필요.\n"
+            f"# {folder.name}\n\n**요약**: 자동 생성 실패 — 수동 작성 필요.\n"
         )
 
     # ---------- Processing ----------
